@@ -1,0 +1,44 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local environment and secret files
+.env
+.env.*
+config.py
+config.local.py
+config.mimir.py
+config.argus.py
+*.secret.py
+
+# Private runtime copies
+ARGUS_main.py
+MIMIR_main.py
+
+# Local logs and runtime state
+*.log
+scan_whitelist.json
+
+# Local model artifacts and checkpoints
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+adapters/
+checkpoints/
+outputs/
+runs/
+wandb/
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
