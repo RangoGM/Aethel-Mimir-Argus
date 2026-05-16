@@ -165,6 +165,10 @@ Model weights are excluded because they are large artifacts and may have separat
 - `test_comparison.py` reproduces the prompt-engineered versus fine-tuned evaluation.
 - `netconf_style.py` generates the cumulative evaluation figure.
 
+## Change Control
+
+Future documentation and code changes should be proposed through pull requests before they are merged into `main`. This keeps AI-assisted edits reviewable by the project owner and preserves a clear approval history for academic and portfolio review.
+
 ## Safety Notice
 
 This is a research prototype for controlled environments and legacy-switch experimentation.
