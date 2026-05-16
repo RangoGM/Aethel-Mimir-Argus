@@ -1,5 +1,4 @@
 # Copy this file to config.py and replace the placeholder values locally.
-# Keep config.py private; commit only this example file.
 
 ROUTER_CONFIG = {
     "device_type": "cisco_ios",
