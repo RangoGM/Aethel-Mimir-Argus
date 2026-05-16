@@ -1,6 +1,6 @@
 # Æthel MIMIR-ARGUS
 
-Local AI orchestration and security monitoring for legacy Cisco Catalyst 2960 switches.
+Local AI orchestration and security monitoring for legacy Cisco Catalyst 2960 switches and Cisco 2811 router lab environments.
 
 MIMIR and ARGUS are two complementary agents built for environments where modern programmable interfaces are limited and operational work still depends on SSH, CLI, syslog, and SNMP. The project combines local LLM inference, live command validation, Layer 2 security workflows, and observability tooling for legacy infrastructure.
 
@@ -37,9 +37,28 @@ Legacy Catalyst platforms remain common in small and medium networks, but they d
 - use hardware-enforced security features already available on the switch
 - recover observability when syslog visibility is degraded by rate limiting
 
+## Runtime Environment
+
+The reference deployment separates monitoring from AI inference because the school-side server is suitable for observability workloads but not strong enough for local LLM execution.
+
+- Cisco Catalyst 2960 switches for Layer 2 security validation
+- Cisco 2811 router for legacy routing and lab topology support
+- Ubuntu monitoring server for syslog ingestion, Loki, Prometheus, Grafana, and observability pipelines
+- Personal GPU workstation for Ollama-based local AI inference and agent execution
+- SSH access to monitored Cisco devices
+- Python-based automation and validation tooling
+
+## Scope and Threat Model
+
+This project focuses on Layer 2 security monitoring, assisted administration, and legacy Cisco lab infrastructure built around Catalyst 2960 switches and a Cisco 2811 router. It is intended for controlled lab, academic, and small-network experimentation rather than unsupervised production automation.
+
+The design assumes that administrators remain responsible for final approval of risky configuration changes. Switch credentials, monitoring endpoints, report hosts, and the personal AI workstation must be protected by normal operational controls.
+
+The Ubuntu monitoring host is treated as an observability node, while local LLM inference runs on a separate personal PC. This separation keeps monitoring available on lower-power infrastructure while reserving model execution for hardware capable of running local AI workloads.
+
 ## Cost Profile
 
-The reference deployment is designed for zero additional software-license fees. The recurring stack uses open-source or community-licensed components such as Grafana, Loki, Prometheus, and local Llama-family inference, so the practical costs are the existing network devices, Ubuntu monitoring server, local GPU host, electricity, storage, and normal maintenance.
+The reference deployment is designed to avoid additional commercial software-license fees. The recurring stack uses open-source or community-licensed components such as Grafana, Loki, Prometheus, and local Llama-family inference, so the practical costs are the existing network devices, Ubuntu monitoring server, local GPU workstation, electricity, storage, and normal maintenance.
 
 No-fee software is not license-free software: each component still has its own license terms and must be used in compliance with them.
 
@@ -56,7 +75,7 @@ The frozen 150-case comparison is stored in `results/enhanced_results_extended.j
 | Safety category | 0.0% | 100.0% |
 | Orchestration category | 100.0% | 100.0% |
 
-The fine-tuned model improves safety and workflow adherence substantially, but it is not perfect. Residual weaknesses remain in context-sensitive reasoning and deep-clean command synthesis; raw evaluation outputs are included for transparency.
+The fine-tuned model improves safety and workflow adherence substantially, but it is not perfect. Residual weaknesses remain in context-sensitive reasoning and deep-clean command synthesis; raw evaluation outputs are included for transparency. These results measure the frozen local evaluation set and should not be interpreted as a guarantee of general performance on arbitrary network-change requests.
 
 ### ARGUS hardware validation
 
@@ -73,7 +92,7 @@ ARGUS was evaluated on physical hardware across 24 attack windows over approxima
 ## Repository Layout
 
 ```text
-vcris-mimir-argus/
+Aethel-Mimir-Argus/
 ├── README.md
 ├── LICENSE
 ├── docs/
