@@ -1,4 +1,4 @@
-# VCRIS MIMIR-ARGUS
+# Æthel MIMIR-ARGUS
 
 Local AI orchestration and security monitoring for legacy Cisco Catalyst 2960 switches.
 
@@ -74,33 +74,35 @@ ARGUS was evaluated on physical hardware across 24 attack windows over approxima
 
 ```text
 vcris-mimir-argus/
-|-- README.md
-|-- LICENSE
-|-- docs/
-|-- mimir/
-|   |-- MIMIR.py
-|   |-- Modelfile.mimir
-|   `-- Modelfile.planner
-|-- argus/
-|   |-- ARGUS.py
-|   |-- Modelfile.argus
-|   `-- Modelfile.report
-|-- finetune/
-|   |-- admin_dataset.json
-|   |-- dataset_unsloth.json
-|   |-- finetune_mimir.py
-|   |-- export_mimir.py
-|   |-- test_comparison.py
-|   `-- netconf_style.py
-|-- pipeline/
-|   |-- grafana-setup.sh
-|   `-- grafana-uninstall.sh
-|-- results/
-|   |-- enhanced_results_extended.json
-|   `-- ieee_mimir_150_cumulative.png
-`-- configs/
-    |-- config.mimir.example.py
-    `-- config.argus.example.py
+├── README.md
+├── LICENSE
+├── docs/
+│   └── Topology.png
+├── mimir/
+|   ├── MIMIR.py
+|   ├── Modelfile.mimir
+|   └── Modelfile.planner
+├── argus/
+|   ├── ARGUS.py
+|   ├── Modelfile.argus
+|   └── Modelfile.report
+├── finetune/
+|   ├── admin_dataset.json
+|   ├── dataset_unsloth.json
+|   ├── finetune_mimir.py
+|   ├── export_mimir.py
+|   ├── test_comparison.py
+|   └── netconf_style.py
+├── pipeline/
+|   ├── grafana-setup.sh
+|   └── grafana-uninstall.sh
+├── results/
+|   ├── enhanced_results_extended.json
+|   ├── mimir_150_cumulative.png
+|   └── mimir_150_cumulative.pdf
+└── configs/
+    ├── config.mimir.example.py
+    └── config.argus.example.py
 ```
 
 ## Configuration
