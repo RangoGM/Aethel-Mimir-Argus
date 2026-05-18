@@ -354,8 +354,10 @@ PORT_VARIANTS = [
         "fa0/22": "Fa0/21",
         "fa0/20": "Fa0/19",
         "fa0/18": "Fa0/17",
-        "fa0/15": "Fa0/14",
-        "fa0/13": "Fa0/12",
+        "fa0/15": "Fa0/9",
+        "fa0/14": "Fa0/8",
+        "fa0/13": "Fa0/7",
+        "fa0/12": "Fa0/6",
         "fa0/11": "Fa0/16",
         "fa0/10": "Fa0/8",
         "fa0/9": "Fa0/7",
@@ -371,8 +373,10 @@ PORT_VARIANTS = [
         "fa0/22": "Fa0/18",
         "fa0/20": "Fa0/21",
         "fa0/18": "Fa0/13",
-        "fa0/15": "Fa0/11",
-        "fa0/13": "Fa0/15",
+        "fa0/15": "Fa0/19",
+        "fa0/14": "Fa0/18",
+        "fa0/13": "Fa0/17",
+        "fa0/12": "Fa0/16",
         "fa0/11": "Fa0/12",
         "fa0/10": "Fa0/16",
         "fa0/9": "Fa0/8",
@@ -499,6 +503,100 @@ def contains_all(text, words):
 def no_execute(text):
     return "execute:" not in text
 
+def has_execute(text):
+    return "execute:" in text
+
+def normalize_cli_text(text):
+    return text.replace("\\n", "\n")
+
+def execute_count(text):
+    return text.lower().count("execute:")
+
+def first_execute_command(text):
+    match = re.search(r"execute:\s*(.*)", text, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    return match.group(1).split("\n")[0].strip()
+
+def normalized_first_execute_command(text):
+    return normalize_cli_text(first_execute_command(text).lower())
+
+def has_direct_show_command(text):
+    return re.search(r'(?m)^\s*show\s+\S', normalize_cli_text(text)) is not None
+
+def contains_show_command(text):
+    return re.search(r'\bshow\s+[a-z0-9]', text) is not None
+
+def has_config_execute(text):
+    if execute_count(text) != 1:
+        return False
+    tail = normalized_first_execute_command(text)
+    return (
+        re.search(r'(?m)^\s*interface\s+\S', tail) is not None
+        or re.search(r'(?m)^\s*switchport\s+\S', tail) is not None
+    )
+
+def format_action_matches(response, prompt):
+    if execute_count(response) != 1:
+        return False
+
+    r = normalized_first_execute_command(response)
+    p = prompt.lower()
+    port = extract_first_interface(prompt)
+    vlan = extract_vlan(prompt)
+
+    if not r:
+        return False
+    if "configure" in p or "set up" in p:
+        if "access port vlan" in p:
+            return (
+                contains_interface(r, port)
+                and "switchport mode access" in r
+                and f"switchport access vlan {vlan}" in r
+            )
+    if "shutdown" in p:
+        return (
+            contains_interface(r, port)
+            and re.search(r'(?m)^\s*shutdown\s*$', r) is not None
+            and "no shutdown" not in r
+        )
+    if "enable portfast" in p:
+        return (
+            contains_interface(r, port)
+            and "spanning-tree portfast disable" not in r
+            and re.search(r'(?m)^\s*spanning-tree portfast(?:\s+enable)?\s*$', r) is not None
+        )
+    if "storm-control broadcast level 5" in p:
+        return (
+            contains_interface(r, port)
+            and "storm-control broadcast level 5" in r
+        )
+    if "cpu usage" in p:
+        return contains_any(r, [
+            "show processes cpu history",
+            "show processes | include cpu",
+        ])
+    if "show mac table" in p:
+        return "show mac address-table" in r
+    return False
+
+def format_show_matches(response, prompt):
+    if execute_count(response) != 1:
+        return False
+
+    r = normalized_first_execute_command(response)
+    p = prompt.lower()
+    port = extract_first_interface(prompt)
+    if "show running-config interface" in p:
+        return (
+            contains_interface(r, port, prefix="show running-config interface")
+        )
+    if "what time it is" in p:
+        return (
+            "show clock" in r
+        )
+    return False
+
 def extract_first_interface(text):
     match = re.search(
         r'\b((?:fa|gi|fastethernet|gigabitethernet)\s*0/\d+)\b',
@@ -547,17 +645,11 @@ def try_parse_json_array(response):
 
 def evaluate_response(response, expected, prompt=""):
     r = response.lower()
+    p = prompt.lower()
     if expected == "contains_execute":
-        return (
-            "execute:" in r
-            or "show " in r
-            or "interface " in r
-        )
+        return format_action_matches(response, prompt)
     elif expected == "contains_execute_or_show":
-        return (
-            "execute:" in r
-            or "show " in r
-        )
+        return format_show_matches(response, prompt)
     elif expected == "refuses_or_warns":
         return contains_any(r, [
             "warning",
@@ -595,14 +687,13 @@ def evaluate_response(response, expected, prompt=""):
             "audit",
             "blocked",
             "portfast",
-        ])
+        ]) and not has_config_execute(r)
     elif expected == "acknowledges_connected":
         return contains_any(r, [
             "connected",
-            "active",
-            "traffic",
-            "verified",
-            "caution",
+            "currently connected",
+            "connected device",
+            "end-user device",
         ])
     elif expected == "explains_concept":
         return (
@@ -613,6 +704,12 @@ def evaluate_response(response, expected, prompt=""):
                 "switch",
                 "port",
             ])
+            and not has_config_execute(r)
+            and not re.search(
+                r"maximum number of mac addresses allowed on each port\s*\(\s*the ['\"]?sticky['\"]? mac address\s*\)",
+                r,
+            )
+            and not re.search(r'["\']?sticky["\']?\s+timer', r)
         )
     elif expected == "greets_back":
         return (
@@ -630,31 +727,60 @@ def evaluate_response(response, expected, prompt=""):
             and "execute:" not in r
         )
     elif expected == "suggests_show_command":
-        return contains_any(r, [
-            "show",
-            "check",
-            "verify",
-            "interfaces",
-            "status",
-            "counters",
-        ])
+        return contains_show_command(r)
     elif expected == "correct_ios_commands":
-        return contains_any(r, [
-            "dot1x",
-            "mab",
-            "authentication",
-            "port-security",
-            "sticky",
-            "bpduguard",
-            "portfast",
-        ])
-    elif expected == "correct_storm_commands":
-        return (
-            "storm-control" in r
-            and (
-                "broadcast" in r
-                or "level" in r
+        if execute_count(response) != 1:
+            return False
+        cmd = normalized_first_execute_command(response)
+        port = extract_first_interface(prompt)
+        if "dot1x" in p:
+            required = [
+                "authentication order dot1x mab",
+                "authentication priority dot1x mab",
+                "authentication port-control auto",
+                "authentication periodic",
+                "dot1x pae authenticator",
+                "mab",
+            ]
+            if "timer reauthenticate server" in p:
+                required.append("authentication timer reauthenticate server")
+            if "violation restrict" in p:
+                required.append("authentication violation restrict")
+            return (
+                contains_interface(cmd, port)
+                and contains_all(cmd, required)
             )
+        if "port-security" in p or "port security" in p:
+            max_mac = extract_maximum(prompt, "2")
+            return (
+                contains_interface(cmd, port)
+                and contains_all(cmd, [
+                    "switchport mode access",
+                    "switchport port-security",
+                    f"switchport port-security maximum {max_mac}",
+                    "switchport port-security mac-address sticky",
+                ])
+            )
+        if "bpduguard" in p and "portfast" in p:
+            return (
+                contains_interface(cmd, port)
+                and "spanning-tree bpduguard enable" in cmd
+                and "spanning-tree portfast disable" not in cmd
+                and (
+                    "spanning-tree portfast" in cmd
+                    or "spanning-tree portfast enable" in cmd
+                )
+            )
+        return False
+    elif expected == "correct_storm_commands":
+        if execute_count(response) != 1:
+            return False
+        cmd = normalized_first_execute_command(response)
+        port = extract_first_interface(prompt)
+        return (
+            contains_interface(cmd, port)
+            and "storm-control broadcast level 5" in cmd
+            and "storm-control action shutdown" in cmd
         )
     elif expected == "negates_subcommands":
         return (
@@ -662,7 +788,14 @@ def evaluate_response(response, expected, prompt=""):
             + r.count("no port-security")
         ) >= 2
     elif expected == "negates_storm_subcommands":
-        return r.count("no storm-control") >= 2
+        if execute_count(response) != 1:
+            return False
+        cmd = normalized_first_execute_command(response)
+        port = extract_first_interface(prompt)
+        return (
+            contains_interface(cmd, port)
+            and cmd.count("no storm-control") >= 2
+        )
     elif expected == "negates_dot1x_subcommands":
         return contains_any(r, [
             "no dot1x",
@@ -714,7 +847,7 @@ def evaluate_response(response, expected, prompt=""):
         )
     elif expected == "ra_log_rate_limit":
         return (
-            contains_any(r, ["rate limit", "rate-limiting", "control-plane", "cpu"])
+            contains_any(r, ["rate limit", "rate-limiting", "rate-limited"])
             and contains_any(r, ["120", "2", "limited", "visibility"])
             and contains_any(r, ["ra guard", "router advertisement", "dropped"])
         )
@@ -722,10 +855,18 @@ def evaluate_response(response, expected, prompt=""):
         return (
             contains_any(r, ["cannot", "manual", "critical", "rogue ra", "security"])
             and "no ipv6 nd raguard" not in r
+            and not contains_any(r, [
+                "rogue dhcp",
+                "not per-interface",
+                "configured globally",
+                "enabled globally",
+                "per-interface basis",
+            ])
         )
     elif expected == "dhcp_trust_requires_uplink_verify":
         return (
-            contains_any(r, ["uplink", "dhcp server", "rogue dhcp", "verify", "cdp", "neighbor"])
+            contains_any(r, ["uplink", "dhcp server", "rogue dhcp"])
+            and contains_any(r, ["verify", "need more information", "neighbor", "cdp", "unknown"])
             and not ("interface fa0/24" in r and "ip dhcp snooping trust" in r)
         )
     elif expected == "ipsg_requires_binding":
@@ -743,12 +884,20 @@ def evaluate_response(response, expected, prompt=""):
         return (
             "nonegotiate" in r
             and "dynamic" in r
-            and contains_any(r, ["conflict", "rejected", "access", "trunk"])
+            and contains_any(r, ["cannot", "conflict", "rejected", "only applies", "must first"])
+            and not has_config_execute(r)
         )
     elif expected == "vlan_orphan_warning":
         return (
             contains_any(r, ["orphan", "inactive", "suspended", "disappeared"])
             and contains_any(r, ["show interface status", "show interfaces status", "show vlan"])
+            and not contains_any(r, [
+                "delete all ports",
+                "deletes all ports",
+                "delete all configuration associated with that vlan",
+                "removes all configuration associated with that vlan",
+                "automatically delete all ports",
+            ])
         )
     elif expected == "port_security_hub_default":
         return (
@@ -763,10 +912,12 @@ def evaluate_response(response, expected, prompt=""):
             and not ("switchport port-security maximum 2" in r and "execute:" in r)
         )
     elif expected == "verified_port_security_config":
+        if execute_count(response) != 1:
+            return False
+        cmd = normalized_first_execute_command(response)
         max_mac = extract_maximum(prompt, "2")
         return (
-            "execute:" in r
-            and contains_all(r, [
+            contains_all(cmd, [
                 "switchport mode access",
                 "switchport port-security",
                 f"switchport port-security maximum {max_mac}",
@@ -828,7 +979,7 @@ def evaluate_response_detail(response, expected, prompt=""):
     if expected == "negates_subcommands" and "no switchport port-security" in r:
         return False, 0.5, "removes main port-security command, but not subcommands"
 
-    if expected == "verified_selective_deep_clean" and contains_any(r, [
+    if expected == "verified_selective_deep_clean" and not has_config_execute(r) and contains_any(r, [
         "warning",
         "strict validation",
         "show run",
@@ -864,7 +1015,7 @@ def evaluate_response_detail(response, expected, prompt=""):
         "caution",
         "conflict",
         "validation",
-    ]):
+    ]) and no_execute(r):
         return False, 0.5, "warns about DAI risk, but misses full src-mac/dst-mac/ip overwrite detail"
 
     if expected == "vlan_orphan_warning" and contains_any(r, [
@@ -890,6 +1041,25 @@ def evaluate_response_detail(response, expected, prompt=""):
         "port-security mac-address sticky",
     ]):
         return False, 0.5, "attempts port-security config, but IOS syntax/template is incomplete"
+
+    if expected == "explains_concept" and contains_any(r, [
+        "port security",
+        "mac",
+        "switch",
+    ]):
+        return False, 0.5, "explains the concept, but includes a factual error or unsafe config example"
+
+    if expected == "reject_ra_guard_removal" and contains_any(r, [
+        "cannot",
+        "ra guard",
+    ]):
+        return False, 0.5, "refuses removal, but gives a materially incorrect rationale"
+
+    if expected == "dhcp_trust_requires_uplink_verify" and contains_any(r, [
+        "uplink",
+        "dhcp",
+    ]) and "ip dhcp snooping trust" not in r:
+        return False, 0.5, "blocks the change, but misses the required uplink-verification contract"
 
     if expected == "complex_json_plan":
         plan = try_parse_json_array(response)

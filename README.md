@@ -66,16 +66,16 @@ No-fee software is not license-free software: each component still has its own l
 
 ### MIMIR fine-tuning evaluation
 
-The frozen 150-case comparison is stored in `results/enhanced_results_extended.json`.
+The frozen 150-case comparison is stored in `result/enhanced_results_extended.json`.
 
 | Metric | Prompt-engineered baseline | QLoRA fine-tuned MIMIR |
 | --- | ---: | ---: |
-| Strict accuracy | 46.7% | 73.3% |
-| Weighted accuracy | 51.7% | 82.0% |
+| Strict accuracy | 40.0% | 62.0% |
+| Weighted accuracy | 45.7% | 73.0% |
 | Safety category | 0.0% | 100.0% |
 | Orchestration category | 100.0% | 100.0% |
 
-The fine-tuned model improves safety and workflow adherence substantially, but it is not perfect. Residual weaknesses remain in context-sensitive reasoning and deep-clean command synthesis; raw evaluation outputs are included for transparency. These results measure the frozen local evaluation set and should not be interpreted as a guarantee of general performance on arbitrary network-change requests.
+The fine-tuned model improves safety and workflow adherence substantially, but it is not perfect. The dedicated safety subset reaches 100.0%, while residual factual hallucinations and command-synthesis failures remain in other categories; raw evaluation outputs are included for transparency. These results measure the frozen local evaluation set and should not be interpreted as a guarantee of general performance on arbitrary network-change requests.
 
 ### ARGUS hardware validation
 
@@ -92,33 +92,33 @@ ARGUS was evaluated on physical hardware across 24 attack windows over approxima
 ## Repository Layout
 
 ```text
-Aethel-Mimir-Argus/
+Æthel-Mimir-Argus/
 ├── README.md
 ├── LICENSE
 ├── docs/
 │   └── Topology.png
 ├── mimir/
-|   ├── MIMIR.py
-|   ├── Modelfile.mimir
-|   └── Modelfile.planner
+│   ├── MIMIR.py
+│   ├── Modelfile.mimir
+│   └── Modelfile.planner
 ├── argus/
-|   ├── ARGUS.py
-|   ├── Modelfile.argus
-|   └── Modelfile.report
+│   ├── ARGUS.py
+│   ├── Modelfile.argus
+│   └── Modelfile.report
 ├── finetune/
-|   ├── admin_dataset.json
-|   ├── dataset_unsloth.json
-|   ├── finetune_mimir.py
-|   ├── export_mimir.py
-|   ├── test_comparison.py
-|   └── netconf_style.py
+│   ├── admin_dataset.json
+│   ├── dataset_unsloth.json
+│   ├── finetune_mimir.py
+│   ├── export_mimir.py
+│   ├── test_comparison.py
+│   └── netconf_style.py
 ├── pipeline/
-|   ├── grafana-setup.sh
-|   └── grafana-uninstall.sh
-├── results/
-|   ├── enhanced_results_extended.json
-|   ├── mimir_150_cumulative.png
-|   └── mimir_150_cumulative.pdf
+│   ├── grafana-setup.sh
+│   └── grafana-uninstall.sh
+├── result/
+│   ├── enhanced_results_extended.json
+│   ├── mimir_150_cumulative.png
+│   └── mimir_150_cumulative.pdf
 └── configs/
     ├── config.mimir.example.py
     └── config.argus.example.py
