@@ -1642,7 +1642,7 @@ ADMIN_REQUEST: {user_input}"""
         for line in filtered_config[:10]:
             print(f"    {line}")
         if len(filtered_config) > 10:
-            print(f"    ... +{len(filtered_config)-8} more")
+            print(f"    ... +{len(filtered_config)-10} more")
         
         # Per-step confirmation (skip if --force)
         if not has_force:
