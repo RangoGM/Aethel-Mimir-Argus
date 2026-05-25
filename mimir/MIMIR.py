@@ -68,6 +68,8 @@ chat_history = []
 AI_MODEL = "mimir-finetuned"
 AI_PLANNER_MODEL = "mimir-finetuned-planner"
 AI_USE_CHAT_HISTORY = False
+ORCHESTRATION_STEP_MAX_COMMANDS = 8
+ORCHESTRATION_BLAST_THRESHOLD = 10
  
 CRITICAL_FORBIDDEN_COMMANDS = [
     "no ipv6 nd raguard",
@@ -317,10 +319,30 @@ def ask_ai(prompt, silent=False, spinner_text="MIMIR is analyzing and checking P
     except Exception as e:
         try:
             spinner.__exit__(None, None, None)
-        except:
+        except Exception:
             pass
         print()
         return f"ERROR: AI_CONNECTION_FAILED ({e})"
+
+def stream_mimir_text(text, label="MIMIR", delay=0.01):
+    """Print a finalized/sanitized AI message progressively for summary paths."""
+    clean_text = (text or "").strip()
+    if not clean_text:
+        return
+
+    sys.stdout.write(f"\n\033[1;36m[{label}]\033[0m \033[1;36m")
+    sys.stdout.flush()
+
+    for token in re.findall(r'\S+\s*|\n+', clean_text):
+        display_token = token.replace("\\n", "\n    ")
+        display_token = display_token.replace("EXECUTE:", "\033[1;32mEXECUTE:\033[0m\033[1;36m")
+        sys.stdout.write(display_token)
+        sys.stdout.flush()
+        if token.strip():
+            time.sleep(delay)
+
+    sys.stdout.write("\033[0m\n\n")
+    sys.stdout.flush()
     
 # --- NETMIKO WITH REDISPATCH (Jump Host) ---
 def netmiko_execute(command, is_config=False):
@@ -345,7 +367,7 @@ def netmiko_execute(command, is_config=False):
                 try:
                     conn_params['ssh_extra_args'] = SSH_LEGACY
                     jump = ConnectHandler(**conn_params)
-                except:
+                except Exception:
                     if 'ssh_extra_args' in conn_params:
                         del conn_params['ssh_extra_args']
                     jump = ConnectHandler(**conn_params)
@@ -384,7 +406,7 @@ def netmiko_execute(command, is_config=False):
         if jump:
             try:
                 jump.disconnect()
-            except:
+            except Exception:
                 pass
     
 # Keywords that trigger auto-audit before risky config
@@ -647,9 +669,30 @@ def write_maintenance_whitelist(port, mode, expire_ts, expected_device=""):
         "verified": False,
         "expected_device": expected_device
     })
-    with open(WHITELIST_FILE, "w", encoding="utf-8") as f:
-        json.dump(entries, f, indent=2)
+    _atomic_json_write(WHITELIST_FILE, entries)
  
+def _atomic_json_write(path, data):
+    """Write JSON atomically: per-writer tmp + fsync + os.replace.
+    The tmp filename includes PID + thread id so concurrent writers
+    (MIMIR + ARGUS, or multiple threads) never collide on the staging file.
+    Final-file semantics are still last-writer-wins on os.replace; this
+    helper guarantees no torn/half-written JSON, not lost-update protection."""
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        # Best-effort cleanup if write/replace failed partway
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+        raise
+
 def load_maintenance_whitelist():
     """Load whitelist entries from JSON"""
     if not os.path.exists(WHITELIST_FILE):
@@ -657,7 +700,7 @@ def load_maintenance_whitelist():
     try:
         with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except Exception:
         return []
  
 def mark_verified(port):
@@ -667,8 +710,7 @@ def mark_verified(port):
         if entry["port"] == port:
             entry["verified"] = True
             break
-    with open(WHITELIST_FILE, "w", encoding="utf-8") as f:
-        json.dump(entries, f, indent=2)
+    _atomic_json_write(WHITELIST_FILE, entries)
  
 def verify_trunk_cdp_identity(port, expected_name=""):
     """Check CDP neighbors — verify admin-provided device name"""
@@ -740,7 +782,7 @@ def open_port_workflow(ports, has_force=False):
             timer_minutes = int(timer_input)
             expire_ts = time.time() + (timer_minutes * 60)
             print(f"[TIMER] Maintenance window: {timer_minutes} minutes")
-        except:
+        except Exception:
             print("[!] Invalid timer. Using 60s auto-scan default.")
             expire_ts = 0  
     else:
@@ -1321,8 +1363,8 @@ def validate_orchestration_plan(steps):
         if not first_line.startswith(("interface ", "interface range ")):
             errors.append(f"{label}: first config command must be interface/interface range.")
 
-        if len(config) > 8:
-            errors.append(f"{label}: config has {len(config)} commands; maximum is 8.")
+        if len(config) > ORCHESTRATION_STEP_MAX_COMMANDS:
+            errors.append(f"{label}: config has {len(config)} commands; maximum is {ORCHESTRATION_STEP_MAX_COMMANDS}.")
 
         if any("execute:" in line.lower() for line in config):
             errors.append(f"{label}: config must not include EXECUTE.")
@@ -1501,7 +1543,6 @@ ADMIN_REQUEST: {user_input}"""
         print("\033[1;31m[CANCELLED]\033[0m")
         return
     
-    BLAST_THRESHOLD = 10
     completed_steps = []
     globally_skipped_ports = set()  
     security_was_removed = False     
@@ -1627,8 +1668,8 @@ ADMIN_REQUEST: {user_input}"""
         
         # === BLAST RADIUS CHECK ===
         port_count = count_ports_in_config(filtered_config)
-        if port_count > BLAST_THRESHOLD and not has_force:
-            print(f"\n  \033[1;41m[BLAST RADIUS WARNING]\033[0m \033[1;31mStep {step_num} affects {port_count} ports (>{BLAST_THRESHOLD})\033[0m")
+        if port_count > ORCHESTRATION_BLAST_THRESHOLD and not has_force:
+            print(f"\n  \033[1;41m[BLAST RADIUS WARNING]\033[0m \033[1;31mStep {step_num} affects {port_count} ports (>{ORCHESTRATION_BLAST_THRESHOLD})\033[0m")
             print(f"  \033[1;36m[INFO]\033[0m Large-scale changes can cause widespread disruption.")
             blast_confirm = input(f"  [?] Confirm large-scale operation? (y/n/skip): ")
             if blast_confirm.lower() == 'skip':
@@ -1642,7 +1683,7 @@ ADMIN_REQUEST: {user_input}"""
         for line in filtered_config[:10]:
             print(f"    {line}")
         if len(filtered_config) > 10:
-            print(f"    ... +{len(filtered_config)-8} more")
+            print(f"    ... +{len(filtered_config)-10} more")
         
         # Per-step confirmation (skip if --force)
         if not has_force:
@@ -1922,543 +1963,549 @@ def print_mimir_banner():
 def print_mini_tips():
     print("\033[1;30m[Tip: Use \033[1;33m--force\033[1;30m bypass | \033[1;36mVERIFIED\033[1;30m skip checks | \033[1;32m!save\033[1;30m write memory | \033[1;31mexit\033[1;30m to quit]\033[0m")
 
-print_mimir_banner()
+def main():
+    global authenticated
+    print_mimir_banner()
  
-while not authenticated:
-    try:
-        print("\n\033[1;33m🛡️  Authentication required.\033[0m")
-        username = input("\033[1;37mUsername: \033[0m")
-        password = getpass.getpass("\033[1;37mPassword: \033[0m")
+    while not authenticated:
+        try:
+            print("\n\033[1;33m🛡️  Authentication required.\033[0m")
+            username = input("\033[1;37mUsername: \033[0m")
+            password = getpass.getpass("\033[1;37mPassword: \033[0m")
  
-        if ADMIN_USERS.get(username) == password:
-            authenticated = True
-            print(f"\n\033[1;32m🔓 [OK] Welcome {username}.\033[0m Type '\033[1;31mexit\033[0m' to quit.\n")
-        else:
-            print("\033[1;31m🔒 [DENIED] Wrong credentials. Try again.\033[0m")
-    except KeyboardInterrupt:
-        print("\n👋 \033[1;30mGoodbye.\033[0m")
-        exit()
- 
-while authenticated:
-    try:
-        is_manually_corrected = False
-
-        print_mini_tips() 
-        prompt = f"[\033[1;34m{username}\033[0m]\033[34m>>>\033[0m "
-        user_input = input(prompt)
- 
-        if not user_input.strip():
-            continue
- 
-        if user_input.lower() in ['exit', 'quit']:
-            print("👋 \033[1;30mGoodbye.\033[0m")
-            break
-
-        if user_input.lower() == "!save":
-            print("\n\033[1;32m[SYSTEM]\033[0m Saving configuration in NVRAM (write memory)...")
-            try:
-                save_result = netmiko_execute("write memory", is_config=False)
-                print(f"\033[1;32m[OK] Configuration has been save!\033[0m\n{save_result}")
-            except Exception as e:
-                print(f"\033[1;31m[!] Error when saving configuration:\033[0m {e}")
-            continue
- 
-        # --- DETECT FLAGS ---
-        clean_input, has_force, has_verified = detect_flags(user_input)
-        
-        if has_force:
-            print("\n\033[1;35m[FLAG]\033[0m \033[1;37m--force detected. Bypassing edge-port auto-audit; trunk/critical protection still enforced.\033[0m")
-        if has_verified:
-            print("\033[1;36m[FLAG]\033[0m \033[1;37mVERIFIED detected. Admin confirms prerequisites.\033[0m")
- 
-        # --- BUILD PROMPT WITH CONTEXT ---
-        prompt_text = f"ADMIN_REQUEST: {clean_input}\nAuthenticated admin: {username}"
-        
-        requested_ports = extract_ports_from_input(clean_input)
-        clean_lower = clean_input.lower()
-        info_request = is_information_request(clean_input)
-
-        if info_request:
-            prompt_text += (
-                "\nSYSTEM_HINT: This is an informational/concept question, not a request to query "
-                "or configure the switch. Answer conversationally from networking knowledge. "
-                "Do not use EXECUTE. If you mention IOS commands, describe them only as examples."
-            )
-
-        if requested_ports and is_open_port_request(clean_input):
-            prompt_text += (
-                "\nSYSTEM_HINT: Admin is requesting an INTERFACE enable/no-shutdown action, "
-                "not a generic unsafe 'open command'. Return a Cisco IOS EXECUTE block using "
-                f"interface {requested_ports[0]} and no shutdown. "
-                "MIMIR will route no shutdown through the Secure Port Open Workflow for live "
-                "validation, hardening, and final admin confirmation."
-            )
-
-        if has_force and requested_ports and re.search(r'\b(shutdown|shut)\b', clean_lower) and "no shut" not in clean_lower:
-            prompt_text += (
-                "\nSYSTEM_HINT: Admin requested an INTERFACE shutdown, not a system shutdown or reboot. "
-                "--force bypasses edge-port audit only; it does NOT override MIMIR backend trunk/critical-port protection. "
-                "Return an interface shutdown EXECUTE block for the requested port(s). "
-                "MIMIR will run final trunk/critical checks and y/n confirmation before execution."
-            )
-
-        if ("ra guard" in clean_lower or "raguard" in clean_lower or re.search(r'\bra\b', clean_lower)) and "counter" in clean_lower:
-            vlan_hint = re.search(r'\bvlan\s+(\d+)\b', clean_input, re.IGNORECASE)
-            if vlan_hint:
-                prompt_text += f"\nSYSTEM_HINT: For RA Guard VLAN counters, use exactly: EXECUTE: show ipv6 snooping counters vlan {vlan_hint.group(1)}"
-            elif requested_ports:
-                prompt_text += f"\nSYSTEM_HINT: For RA Guard interface counters, use exactly: EXECUTE: show ipv6 snooping counters interface {requested_ports[0]}"
+            if ADMIN_USERS.get(username) == password:
+                authenticated = True
+                print(f"\n\033[1;32m🔓 [OK] Welcome {username}.\033[0m Type '\033[1;31mexit\033[0m' to quit.\n")
             else:
-                prompt_text += "\nSYSTEM_HINT: RA Guard hardware counters require a VLAN or interface. If neither VLAN nor interface is provided, ask the admin to specify one and do not use EXECUTE."
-
-        if is_complex_orchestration_request(clean_input) and (has_verified or has_force):
-            print(f"\n\033[1;35m[ORCHESTRATION]\033[0m Complex multi-config detected.")
-            orchestrate_workflow(clean_input, has_force=has_force)
-            continue
-        elif is_complex_orchestration_request(clean_input):
-            print(f"\n\033[1;33m[WARNING]\033[0m Complex multi-config detected. Use VERIFIED to confirm.")
-            continue
-        
-        if has_verified and requested_ports:
-            prompt_text += f"\nADMIN_VERIFICATION: Admin has explicitly verified that ports {', '.join(requested_ports)} meet all prerequisites (edge access mode, active DHCP binding, portfast enabled)."
-
-        is_vlan_migration = bool(re.search(r'switchport\s+access\s+vlan\s+\d+', clean_input, re.IGNORECASE)) or \
-                    bool(re.search(r'\b(?:move|migrate|transfer)\b.*vlan', clean_input, re.IGNORECASE))
-        
-        # --- AUTO-AUDIT (unless --force, VERIFIED, or VLAN migration) ---
-        audit_context = ""
-        if not has_force and not has_verified and not is_vlan_migration and requested_ports:
-            config_keywords = ["config", "enable", "add", "set", "limit", "apply", "configure", 
-                             "shutdown", "shut", "open", "remove", "disable"]
-            is_config_request = any(kw in clean_input.lower() for kw in config_keywords)
-            
-            if is_config_request and should_trigger_audit(clean_input, ""):
-                print("\n\033[1;33m[AUTO-AUDIT]\033[0m Risky config detected. Running edge-port verification...")
-                audit_context = run_edge_port_audit(requested_ports)
-                prompt_text += f"\n{audit_context}"
-                is_port_security_request = (
-                    "port-security" in clean_lower
-                    or "port security" in clean_lower
-                    or ("maximum" in clean_lower and "mac" in clean_lower)
-                )
-                if is_port_security_request and "NO PORTFAST" in audit_context and not has_verified:
-                    prompt_text += (
-                        "\nSYSTEM_HINT: For port-security, NO PORTFAST is CAUTION / not confirmed edge. "
-                        "Do not claim the interface is invalid or not an access port unless audit says TRUNK/BLOCKED. "
-                        "Tell admin to use VERIFIED after confirming the port is an unused edge access port, "
-                        "and offer to check current status/running-config with EXECUTE show commands."
-                    )
-                if "SAFE" in audit_context and "BLOCKED" not in audit_context and re.search(r'\b(shutdown|shut)\b', clean_lower) and "no shut" not in clean_lower:
-                    prompt_text += f"\nSYSTEM_HINT: The auto-audit has already verified {', '.join(requested_ports)} is SAFE for this requested shutdown. Start with this exact caution: WARNING: Shutdown will administratively disable the port until no shutdown is applied. Then return the Cisco IOS command using EXECUTE. Do not ask the admin to type YES or ask 'are you sure' in the AI response because MIMIR will show its own final y/n execution confirmation."
-
-        # --- AI RESPONSE ---
-        if info_request:
-            ai_response = ask_ai(
-                prompt_text,
-                silent=True,
-                spinner_text="MIMIR is explaining the concept",
-                record_history=False,
-            )
-            ai_response = sanitize_information_response(ai_response, clean_input)
-            print(f"\n\033[1;36m[MIMIR]\033[0m \033[1;36m{ai_response}\033[0m\n")
-        else:
-            ai_response = ask_ai(prompt_text)
-
-        # --- SECURITY FILTER ---
-        is_safe, security_msg = validate_security_policy(ai_response)
+                print("\033[1;31m🔒 [DENIED] Wrong credentials. Try again.\033[0m")
+        except KeyboardInterrupt:
+            print("\n👋 \033[1;30mGoodbye.\033[0m")
+            exit()
  
-        if not is_safe:
+    while authenticated:
+        try:
+            is_manually_corrected = False
+
+            print_mini_tips() 
+            prompt = f"[\033[1;34m{username}\033[0m]\033[34m>>>\033[0m "
+            user_input = input(prompt)
+ 
+            if not user_input.strip():
+                continue
+ 
+            if user_input.lower() in ['exit', 'quit']:
+                print("👋 \033[1;30mGoodbye.\033[0m")
+                break
+
+            if user_input.lower() == "!save":
+                print("\n\033[1;32m[SYSTEM]\033[0m Saving configuration in NVRAM (write memory)...")
+                try:
+                    save_result = netmiko_execute("write memory", is_config=False)
+                    print(f"\033[1;32m[OK] Configuration has been save!\033[0m\n{save_result}")
+                except Exception as e:
+                    print(f"\033[1;31m[!] Error when saving configuration:\033[0m {e}")
+                continue
+ 
+            # --- DETECT FLAGS ---
+            clean_input, has_force, has_verified = detect_flags(user_input)
+        
             if has_force:
-                # --force overrides security violations EXCEPT critical ones
-                if any(x in ai_response.lower() for x in ["no ipv6 nd raguard", "no dot1x"]):
-                    print(f"\n\n\033[1;31m{security_msg}\033[0m")
-                    print("\033[1;31m[!] --force CANNOT override critical security features. Blocked.\033[0m")
-                    judge = 's'
-                else:
-                    print(f"\n\033[1;35m[FORCE]\033[0m {security_msg}")
-                    print("\033[1;35m[FORCE]\033[0m Audit bypassed. Ready to save dataset.")
-                    judge = input("[?] AI correct? (y = Yes / s = Wrong, retype / n = Skip): ")
-            else:
-                print(f"\n{security_msg}")
-                print("\033[1;33mAction:\033[0m Mandatory correction required.")
-                judge = 's'
-        else:
-            if "[RISK ALERT]" in security_msg:
-                print(f"\n{security_msg}")
-                if has_force:
-                    print("\033[1;35m[FORCE]\033[0m Acknowledged. Proceeding.")
-            judge = input("[?] AI correct? (y = Yes / s = Wrong, retype / n = Skip): ")
+                print("\n\033[1;35m[FLAG]\033[0m \033[1;37m--force detected. Bypassing edge-port auto-audit; trunk/critical protection still enforced.\033[0m")
+            if has_verified:
+                print("\033[1;36m[FLAG]\033[0m \033[1;37mVERIFIED detected. Admin confirms prerequisites.\033[0m")
  
-        if judge.lower() == 's':
-            # --- STEP 1: VERIFY ---
-            suggested_cmd = ""
-            cmd_match = re.search(r"EXECUTE:\s*(.*)", ai_response, re.DOTALL)
-            if cmd_match: suggested_cmd = cmd_match.group(1).split("\n")[0].strip()
-            
-            print(f"\n\033[1;34m[*]\033[0m STEP 1: Verify Switch Data (Optional)")
-            choice = input(f"[?] AI suggested '{suggested_cmd}'. Run? (y/n/custom): ")
-            cmd_to_run = suggested_cmd if choice.lower() == 'y' else (choice if choice.lower() != 'n' and choice != "" else "")
- 
-            if cmd_to_run:
-                is_c = any(x in cmd_to_run.lower() for x in ["conf t", "interface", "vlan", "ipv6"])
-                print(f"\n\033[1;37m[REAL RESULT]\033[0m\n{netmiko_execute(cmd_to_run, is_config=is_c)}\n")
- 
-            # --- STEP 2: EDIT ---
-            print("\033[1;34m[*]\033[0m STEP 2: Fix the Response")
-            display_text = re.sub(r'\*\*(.*?)\*\*', r'\033[1m\1\033[1;37m', ai_response)
-            display_text = display_text.replace("EXECUTE:", "\033[1mEXECUTE:\033[1;37m")
-            print("\033[1;30m" + "-" * 40 + "\033[0m")
-            print(f"\033[1;37m{display_text}\033[0m")
-            print("\033[1;30m" + "-" * 40 + "\033[0m")
-            print("\033[1;34m[*]\033[0m (Type 'U' to undo last line | 'END' to save | 'EXIT' to cancel)")
- 
-            final_lines = []
-            while True:
-                line = sys.stdin.readline()
-                if not line: break
-                
-                cmd_upper = line.strip().upper()
- 
-                if cmd_upper == "END": 
-                    break
-                if cmd_upper == "EXIT":
-                    final_lines.clear()
-                    break
-                if cmd_upper == "U":
-                    if final_lines:
-                        removed = final_lines.pop()
-                        print(f"    \033[1;33m[UNDO]\033[0m Removed: {removed.strip()}")
-                    else:
-                        print("    \033[1;31m[!]\033[0m Nothing to undo.")
-                    continue
- 
-                final_lines.append(line)
- 
-            correct_output = "".join(final_lines).strip()
-            
-            if correct_output:
-                save_qa_dataset(prompt_text, correct_output)
-                ai_response = correct_output
-                is_manually_corrected = True
-                print("\033[1;32m[+]\033[0m Saved corrected answer!")
-            else:
-                print("\033[1;33m[!]\033[0m Empty. Skipping dataset save...")
- 
-        elif judge.lower() == 'y':
-            save_qa_dataset(prompt_text, ai_response)
-            print("\033[1;32m[+]\033[0m Saved correct answer!")
- 
-        else:
-            print("\033[1;33m[!]\033[0m Skipped saving.")
-            continue
- 
-        # --- EXECUTE LOGIC ---
-        if "EXECUTE:" in ai_response:
-            execute_count = ai_response.count("EXECUTE:")
-            if execute_count > 1:
-                print(f"\n\033[1;31m[!]\033[0m AI returned {execute_count} EXECUTE blocks. System processes one at a time.")
-                print(f"\033[1;33m[!]\033[0m Please split your request into separate commands and try again.")
-                continue
+            # --- BUILD PROMPT WITH CONTEXT ---
+            prompt_text = f"ADMIN_REQUEST: {clean_input}\nAuthenticated admin: {username}"
+        
+            requested_ports = extract_ports_from_input(clean_input)
+            clean_lower = clean_input.lower()
+            info_request = is_information_request(clean_input)
 
-            raw_cmd = ai_response.split("EXECUTE:")[1].split("\n")[0].strip()
-            move_all_match = re.search(
-                r'(?:move|migrate|transfer)\s+all.*?vlan\s+(\d+).*?(?:to\s+)?vlan\s+(\d+)',
-                ai_response,
-                re.IGNORECASE
-            )
-            if move_all_match:
-                src = move_all_match.group(1)
-                dst = move_all_match.group(2)
-                print(f"\n\033[1;35m[WORKFLOW]\033[0m AI triggered move all: VLAN {src} → {dst}")
-                vlan_move_all_workflow(src, dst, has_force=has_force)
-                continue
- 
-            cmd = raw_cmd.split("| MSG")[0].strip()
- 
-            is_conf = not cmd.startswith(("show", "ping", "traceroute", "clear", "terminal"))
- 
-            if cmd.startswith("show "):
-                if "| section include" in cmd:
-                    base_cmd = cmd.split("|")[0].strip()
-                    filters = cmd.split("include")[1].strip().split("|")
-                    result = netmiko_execute(base_cmd, is_config=False)
-                    filtered = []
-                    capture = False
-                    for line in result.splitlines():
-                        if any(f.strip() in line for f in filters):
-                            capture = True
-                        elif line.startswith("interface ") or line.startswith("!"):
-                            if capture and line.startswith("!"):
-                                capture = False
-                        if capture:
-                            filtered.append(line)
-                    result = "\n".join(filtered)
- 
-                elif ("Administrative Mode:" in cmd and "spanning-tree portfast" in cmd and "\\n" in cmd):
-                    commands = [c.strip() for c in cmd.replace("\\n", "\n").split("\n") if c.strip()]
-                    print(f"\033[1;36m[*]\033[0m Running Security Audit on Switch...")
- 
-                    if len(commands) >= 2:
-                        sw_out = netmiko_execute(commands[0], is_config=False)
-                        run_out = netmiko_execute(commands[1], is_config=False)
-                        status_out = netmiko_execute("show interfaces status", is_config=False)
- 
-                        safe_ports, critical_ports = parse_safe_shutdown(sw_out, run_out, status_out)
- 
-                        print(f"\n\033[1;36m{'='*50}\033[0m")
-                        print(f"  \033[1;36mSECURITY AUDIT RESULT\033[0m")
-                        print(f"\033[1;36m{'='*50}\033[0m")
-                        if critical_ports:
-                            print(f"  \033[1;31mCRITICAL\033[0m (has description): {', '.join(sorted(critical_ports))}")
-                        
-                        if safe_ports:
-                            print(f"  \033[1;32mSAFE\033[0m to shutdown ({len(safe_ports)}): {', '.join(safe_ports)}")
-                            print(f"\033[1;36m{'='*50}\033[0m")
- 
-                            confirm = input(f"\n[CONFIRM] Shutdown {len(safe_ports)} safe ports? (y/n): ")
-                            if confirm.lower() == 'y':
-                                from collections import defaultdict
-                                groups = defaultdict(list)
-                                for p in safe_ports:
-                                    prefix, num = p.rsplit("/", 1)
-                                    groups[prefix].append(int(num))
-                                ranges = []
-                                for prefix in sorted(groups):
-                                    nums = sorted(groups[prefix])
-                                    start = end = nums[0]
-                                    for n in nums[1:]:
-                                        if n == end + 1:
-                                            end = n
-                                        else:
-                                            ranges.append(f"{prefix}/{start}" if start == end else f"{prefix}/{start}-{end}")
-                                            start = end = n
-                                    ranges.append(f"{prefix}/{start}" if start == end else f"{prefix}/{start}-{end}")
-                                
-                                range_str = "interface range " + ",".join(ranges)
-                                shut_cmd = f"{range_str}\\nshutdown"
-                                result = netmiko_execute(shut_cmd, is_config=True) 
-                                print(f"\033[1;37m[RESULT]\033[0m\n{result}")
-                            else:
-                                print("\033[1;31m[CANCELLED]\033[0m")
-                        else:
-                            print(f"  \033[1;41mWARNING:\033[0m \033[1;31mNo safe ports found!\033[0m")
-                            print(f"  \033[1;33mAll ports are either Trunks, missing Portfast, or have description.\033[0m")
-                            print(f"\033[1;36m{'='*50}\033[0m")
-                    else:
-                        print("\033[1;31m[ERROR]\033[0m Could not parse 2 show commands.")
-                    continue
- 
-                else:
-                    result = netmiko_execute(cmd, is_config=False)
- 
-                print(f"\033[1;37m[RAW OUTPUT]\033[0m\n{result}")
- 
-                pre_summary = ""
-                if "interfaces status" in cmd:
-                    disabled, connected, notconnect = [], [], []
-                    for line in result.splitlines():
-                        match = re.match(r'^(Fa|Gi|Te|Et)(\d+/\d+(/\d+)?)\s+', line.strip())
-                        if match:
-                            port = match.group(0).strip()
-                            if "disabled" in line: disabled.append(port)
-                            elif "connected" in line: connected.append(port)
-                            elif "notconnect" in line: notconnect.append(port)
-                    pre_summary = f"\nPARSED BY SYSTEM (accurate):\n- Disabled ({len(disabled)}): {', '.join(disabled)}\n- Connected ({len(connected)}): {', '.join(connected)}\n- Notconnect ({len(notconnect)}): {', '.join(notconnect)}\nUSE THESE NUMBERS. Do not recount."
-                
-                if "processes cpu history" in cmd:
-                    # Replace ASCII graph with simple numbers
-                    simple_cpu = netmiko_execute("show processes cpu | include CPU", is_config=False)
-                    pre_summary = f"""
-                    [SYSTEM OVERRIDE - CRITICAL DATA]: 
-                    WARNING: As an AI, you cannot reliably parse ASCII graphs. 
-                    IGNORE the ASCII graph in the RAW CLI above. 
-                    STRICTLY USE these parsed numbers to analyze CPU load:
-                    >>> {simple_cpu.strip()} <<<
-                    """
-
-                if not is_manually_corrected:
-                    ask_sum = input("\n[?] Do you want AI to summarize this result? (y/n): ")
-                    if ask_sum.lower() == 'y':
-                        if "processes cpu history" in cmd:
-                            dynamic_steps = "Analyze the CPU usage strictly using the [SYSTEM OVERRIDE] numbers. Report the CPU load trends (average and peaks) concisely."
-                        elif "interfaces status" in cmd:
-                            dynamic_steps = textwrap.dedent("""
-                                [STRICT SYSTEM AUDIT]:
-                                1. SCAN: Look at the 'Status' column for EVERY port.
-                                2. LIST: List all ports marked 'connected' (DO NOT miss Fa0/1 Trunk).
-                                3. COUNT: Sum the total for each status.
-                                
-                                [OUTPUT FORMAT - FILL IN THE BLANKS]:
-                                * [TOTAL_CONNECTED] ports are connected: [List ports with Descriptions, e.g., Fa0/1 (TRUNK), Fa0/9 (SERVER)]
-                                * [TOTAL_DISABLED] ports are disabled: [Group port names, e.g., Fa0/2-8, Fa0/11-24]
-                                
-                                [STRICT RULE]: No narrative. No 'Mapping' or 'Filtering' headers. Just the two lines above.
-                            """).strip()
-                            
-                        elif "running-config" in cmd:
-                            dynamic_steps = textwrap.dedent("""
-                                1. SCANNING: Look at each 'interface' line.
-                                2. VERIFICATION: Check if 'attach-policy' is immediately below.
-                                - YES: PROTECTED.
-                                - NO: VULNERABLE.
-                                3. VLAN AUDIT: Identify VLANs with global policies.
-                                [MANDATORY OUTPUT FORMAT]:
-                                - PROTECTED PORTS: [List]
-                                - GLOBAL PROTECTION: [List]
-                                - SECURITY GAPS: [List ALL vulnerable ports]
-                                - FHS STATUS: [Briefly mention RA Guard/Snooping]
-                                """).strip()
-                        else:
-                            dynamic_steps = "Summarize the key information from the RAW CLI output concisely. Focus ONLY on what is actually present in the data."
-                        
-                        summary_prompt = f"""
-                        SUMMARY_MODE: The command has ALREADY been executed. Summarize RAW CLI output only.
-                        [ROLE]: Senior Forensic Network Auditor.
-                        [STRICT RULES]:
-                        - Do NOT use EXECUTE.
-                        - Do NOT suggest or repeat a show/config command.
-                        - Do NOT answer the original admin request.
-                        - Summarize only facts visible in RAW CLI.
-                     
-                        [INPUT]:
-                        - COMMAND ALREADY RUN: {cmd}
-                        - RAW CLI: {result[-2000:]}
-                        {pre_summary}
-                     
-                        [FORENSIC ANALYSIS STEPS]:
-                        {dynamic_steps}
-                    
-                        [LIMIT]: 5 lines max. No hallucinations. If a port has no config, it is NOT protected.
-                        """
-                     
-                        print("\n\033[1;36m[MIMIR IS ANALYZING SYSTEM LOGS...]\033[0m")
-                        summary = ask_ai(summary_prompt, silent=True, spinner_text="MIMIR is summarizing raw CLI output")
-                        if "execute:" in summary.lower():
-                            summary = local_cli_summary(cmd, result, pre_summary)
-                        print(f"\n\033[1;36m[MIMIR]\033[0m \033[1;36m{summary}\033[0m\n")
-                else:
-                    print("\n\033[1;36m[INFO]\033[0m Manual correction applied. Skipping auto-summary to avoid repetition.")
-                    is_manually_corrected = False
- 
-# --- CONFIG COMMAND EXECUTION ---
-
-            else:
-                if audit_context and "BLOCKED" in audit_context:
-                    print(f"\n\033[1;31m[AUTO-AUDIT BLOCK]\033[0m Cannot execute — audit found protected/trunk ports.")
-                    print(f"\033[1;34m[INFO]\033[0m Use --force to override audit (except trunk or critical ports).")
-                    if not has_force:
-                        continue
-
-                is_dangerous_trunk_cmd = (
-                    ("shutdown" in cmd.lower() and "no shutdown" not in cmd.lower()) or
-                    ("switchport mode" in cmd.lower() and "trunk" not in cmd.lower())
+            if info_request:
+                prompt_text += (
+                    "\nSYSTEM_HINT: This is an informational/concept question, not a request to query "
+                    "or configure the switch. Answer conversationally from networking knowledge. "
+                    "Do not use EXECUTE. If you mention IOS commands, describe them only as examples."
                 )
-                if is_dangerous_trunk_cmd:
-                    has_trunk, trunk_list = is_trunk_port(cmd)
-                    if has_trunk:
-                        print(f"\n\033[1;41m[CRITICAL BLOCK]\033[0m \033[1;31mTrunk port(s) detected: {', '.join(trunk_list)}\033[0m")
-                        print("\033[1;31m[!]\033[0m \033[1;33mShutdown trunk or Changing trunk mode = network isolation. BLOCKED regardless of --force or VERIFIED.\033[0m")
-                        continue
-                    
-                    if audit_context and any(f"{p}" in audit_context and "CRITICAL" in audit_context for p in extract_ports_from_input(cmd)):
-                        print(f"\n\033[1;41m[CRITICAL BLOCK]\033[0m \033[1;31mServer port(s) detected (from prior audit)\033[0m")
-                        print("\033[1;31m[!]\033[0m \033[1;33mServer ports require manual CLI shutdown. BLOCKED.\033[0m")
-                        continue
-                    port_match = []
-                    matches = re.findall(r'(fa[a-z]*|gi[a-z]*|te[a-z]*|et[a-z]*)\s*(\d+(?:/\d+)?)/(\d+)(?:\s*(?:-|to)\s*(?:(?:fa[a-z]*|gi[a-z]*|te[a-z]*|et[a-z]*)\s*\d+(?:/\d+)?/)?(\d+))?', cmd, re.IGNORECASE)
-                    for match in matches:
-                        prefix = match[0][:2].capitalize()
-                        slot = match[1]
-                        start_port = int(match[2])
-                        if match[3]:
-                            end_port = int(match[3])
-                            for p in range(start_port, int(match[3])+1):
-                                port_match.append(f"{prefix}{slot}/{p}")
+
+            if requested_ports and is_open_port_request(clean_input):
+                prompt_text += (
+                    "\nSYSTEM_HINT: Admin is requesting an INTERFACE enable/no-shutdown action, "
+                    "not a generic unsafe 'open command'. Return a Cisco IOS EXECUTE block using "
+                    f"interface {requested_ports[0]} and no shutdown. "
+                    "MIMIR will route no shutdown through the Secure Port Open Workflow for live "
+                    "validation, hardening, and final admin confirmation."
+                )
+
+            if has_force and requested_ports and re.search(r'\b(shutdown|shut)\b', clean_lower) and "no shut" not in clean_lower:
+                prompt_text += (
+                    "\nSYSTEM_HINT: Admin requested an INTERFACE shutdown, not a system shutdown or reboot. "
+                    "--force bypasses edge-port audit only; it does NOT override MIMIR backend trunk/critical-port protection. "
+                    "Return an interface shutdown EXECUTE block for the requested port(s). "
+                    "MIMIR will run final trunk/critical checks and y/n confirmation before execution."
+                )
+
+            if ("ra guard" in clean_lower or "raguard" in clean_lower or re.search(r'\bra\b', clean_lower)) and "counter" in clean_lower:
+                vlan_hint = re.search(r'\bvlan\s+(\d+)\b', clean_input, re.IGNORECASE)
+                if vlan_hint:
+                    prompt_text += f"\nSYSTEM_HINT: For RA Guard VLAN counters, use exactly: EXECUTE: show ipv6 snooping counters vlan {vlan_hint.group(1)}"
+                elif requested_ports:
+                    prompt_text += f"\nSYSTEM_HINT: For RA Guard interface counters, use exactly: EXECUTE: show ipv6 snooping counters interface {requested_ports[0]}"
+                else:
+                    prompt_text += "\nSYSTEM_HINT: RA Guard hardware counters require a VLAN or interface. If neither VLAN nor interface is provided, ask the admin to specify one and do not use EXECUTE."
+
+            if is_complex_orchestration_request(clean_input) and (has_verified or has_force):
+                print(f"\n\033[1;35m[ORCHESTRATION]\033[0m Complex multi-config detected.")
+                orchestrate_workflow(clean_input, has_force=has_force)
+                continue
+            elif is_complex_orchestration_request(clean_input):
+                print(f"\n\033[1;33m[WARNING]\033[0m Complex multi-config detected. Use VERIFIED to confirm.")
+                continue
+        
+            if has_verified and requested_ports:
+                prompt_text += f"\nADMIN_VERIFICATION: Admin has explicitly verified that ports {', '.join(requested_ports)} meet all prerequisites (edge access mode, active DHCP binding, portfast enabled)."
+
+            is_vlan_migration = bool(re.search(r'switchport\s+access\s+vlan\s+\d+', clean_input, re.IGNORECASE)) or \
+                        bool(re.search(r'\b(?:move|migrate|transfer)\b.*vlan', clean_input, re.IGNORECASE))
+        
+            # --- AUTO-AUDIT (unless --force, VERIFIED, or VLAN migration) ---
+            audit_context = ""
+            if not has_force and not has_verified and not is_vlan_migration and requested_ports:
+                config_keywords = ["config", "enable", "add", "set", "limit", "apply", "configure", 
+                                 "shutdown", "shut", "open", "remove", "disable"]
+                is_config_request = any(kw in clean_input.lower() for kw in config_keywords)
+            
+                if is_config_request and should_trigger_audit(clean_input, ""):
+                    print("\n\033[1;33m[AUTO-AUDIT]\033[0m Risky config detected. Running edge-port verification...")
+                    audit_context = run_edge_port_audit(requested_ports)
+                    prompt_text += f"\n{audit_context}"
+                    is_port_security_request = (
+                        "port-security" in clean_lower
+                        or "port security" in clean_lower
+                        or ("maximum" in clean_lower and "mac" in clean_lower)
+                    )
+                    if is_port_security_request and "NO PORTFAST" in audit_context and not has_verified:
+                        prompt_text += (
+                            "\nSYSTEM_HINT: For port-security, NO PORTFAST is CAUTION / not confirmed edge. "
+                            "Do not claim the interface is invalid or not an access port unless audit says TRUNK/BLOCKED. "
+                            "Tell admin to use VERIFIED after confirming the port is an unused edge access port, "
+                            "and offer to check current status/running-config with EXECUTE show commands."
+                        )
+                    if "SAFE" in audit_context and "BLOCKED" not in audit_context and re.search(r'\b(shutdown|shut)\b', clean_lower) and "no shut" not in clean_lower:
+                        prompt_text += f"\nSYSTEM_HINT: The auto-audit has already verified {', '.join(requested_ports)} is SAFE for this requested shutdown. Start with this exact caution: WARNING: Shutdown will administratively disable the port until no shutdown is applied. Then return the Cisco IOS command using EXECUTE. Do not ask the admin to type YES or ask 'are you sure' in the AI response because MIMIR will show its own final y/n execution confirmation."
+
+            # --- AI RESPONSE ---
+            if info_request:
+                ai_response = ask_ai(
+                    prompt_text,
+                    silent=True,
+                    spinner_text="MIMIR is explaining the concept",
+                    record_history=False,
+                )
+                ai_response = sanitize_information_response(ai_response, clean_input)
+                stream_mimir_text(ai_response)
+            else:
+                ai_response = ask_ai(prompt_text)
+
+            # --- SECURITY FILTER ---
+            is_safe, security_msg = validate_security_policy(ai_response)
+ 
+            if not is_safe:
+                if has_force:
+                    # --force overrides security violations EXCEPT critical ones
+                    if any(x in ai_response.lower() for x in ["no ipv6 nd raguard", "no dot1x"]):
+                        print(f"\n\n\033[1;31m{security_msg}\033[0m")
+                        print("\033[1;31m[!] --force CANNOT override critical security features. Blocked.\033[0m")
+                        judge = 's'
+                    else:
+                        print(f"\n\033[1;35m[FORCE]\033[0m {security_msg}")
+                        print("\033[1;35m[FORCE]\033[0m Audit bypassed. Ready to save dataset.")
+                        judge = input("[?] AI correct? (y = Yes / s = Wrong, retype / n = Skip): ")
+                else:
+                    print(f"\n{security_msg}")
+                    print("\033[1;33mAction:\033[0m Mandatory correction required.")
+                    judge = 's'
+            else:
+                if "[RISK ALERT]" in security_msg:
+                    print(f"\n{security_msg}")
+                    if has_force:
+                        print("\033[1;35m[FORCE]\033[0m Acknowledged. Proceeding.")
+                judge = input("[?] AI correct? (y = Yes / s = Wrong, retype / n = Skip): ")
+ 
+            if judge.lower() == 's':
+                # --- STEP 1: VERIFY ---
+                suggested_cmd = ""
+                cmd_match = re.search(r"EXECUTE:\s*(.*)", ai_response, re.DOTALL)
+                if cmd_match: suggested_cmd = cmd_match.group(1).split("\n")[0].strip()
+            
+                print(f"\n\033[1;34m[*]\033[0m STEP 1: Verify Switch Data (Optional)")
+                choice = input(f"[?] AI suggested '{suggested_cmd}'. Run? (y/n/custom): ")
+                cmd_to_run = suggested_cmd if choice.lower() == 'y' else (choice if choice.lower() != 'n' and choice != "" else "")
+ 
+                if cmd_to_run:
+                    is_c = any(x in cmd_to_run.lower() for x in ["conf t", "interface", "vlan", "ipv6"])
+                    print(f"\n\033[1;37m[REAL RESULT]\033[0m\n{netmiko_execute(cmd_to_run, is_config=is_c)}\n")
+ 
+                # --- STEP 2: EDIT ---
+                print("\033[1;34m[*]\033[0m STEP 2: Fix the Response")
+                display_text = re.sub(r'\*\*(.*?)\*\*', r'\033[1m\1\033[1;37m', ai_response)
+                display_text = display_text.replace("EXECUTE:", "\033[1mEXECUTE:\033[1;37m")
+                print("\033[1;30m" + "-" * 40 + "\033[0m")
+                print(f"\033[1;37m{display_text}\033[0m")
+                print("\033[1;30m" + "-" * 40 + "\033[0m")
+                print("\033[1;34m[*]\033[0m (Type 'U' to undo last line | 'END' to save | 'EXIT' to cancel)")
+ 
+                final_lines = []
+                while True:
+                    line = sys.stdin.readline()
+                    if not line: break
+                
+                    cmd_upper = line.strip().upper()
+ 
+                    if cmd_upper == "END": 
+                        break
+                    if cmd_upper == "EXIT":
+                        final_lines.clear()
+                        break
+                    if cmd_upper == "U":
+                        if final_lines:
+                            removed = final_lines.pop()
+                            print(f"    \033[1;33m[UNDO]\033[0m Removed: {removed.strip()}")
                         else:
-                            port_match.append(f"{prefix}{slot}/{start_port}")
+                            print("    \033[1;31m[!]\033[0m Nothing to undo.")
+                        continue
+ 
+                    final_lines.append(line)
+ 
+                correct_output = "".join(final_lines).strip()
+            
+                if correct_output:
+                    save_qa_dataset(prompt_text, correct_output)
+                    ai_response = correct_output
+                    is_manually_corrected = True
+                    print("\033[1;32m[+]\033[0m Saved corrected answer!")
+                else:
+                    print("\033[1;33m[!]\033[0m Empty. Skipping dataset save...")
+ 
+            elif judge.lower() == 'y':
+                save_qa_dataset(prompt_text, ai_response)
+                print("\033[1;32m[+]\033[0m Saved correct answer!")
+ 
+            else:
+                print("\033[1;33m[!]\033[0m Skipped saving.")
+                continue
+ 
+            # --- EXECUTE LOGIC ---
+            if "EXECUTE:" in ai_response:
+                execute_count = ai_response.count("EXECUTE:")
+                if execute_count > 1:
+                    print(f"\n\033[1;31m[!]\033[0m AI returned {execute_count} EXECUTE blocks. System processes one at a time.")
+                    print(f"\033[1;33m[!]\033[0m Please split your request into separate commands and try again.")
+                    continue
+
+                raw_cmd = ai_response.split("EXECUTE:")[1].split("\n")[0].strip()
+                move_all_match = re.search(
+                    r'(?:move|migrate|transfer)\s+all.*?vlan\s+(\d+).*?(?:to\s+)?vlan\s+(\d+)',
+                    ai_response,
+                    re.IGNORECASE
+                )
+                if move_all_match:
+                    src = move_all_match.group(1)
+                    dst = move_all_match.group(2)
+                    print(f"\n\033[1;35m[WORKFLOW]\033[0m AI triggered move all: VLAN {src} → {dst}")
+                    vlan_move_all_workflow(src, dst, has_force=has_force)
+                    continue
+ 
+                cmd = raw_cmd.split("| MSG")[0].strip()
+ 
+                is_conf = not cmd.startswith(("show", "ping", "traceroute", "clear", "terminal"))
+ 
+                if cmd.startswith("show "):
+                    if "| section include" in cmd:
+                        base_cmd = cmd.split("|")[0].strip()
+                        filters = cmd.split("include")[1].strip().split("|")
+                        result = netmiko_execute(base_cmd, is_config=False)
+                        filtered = []
+                        capture = False
+                        for line in result.splitlines():
+                            if any(f.strip() in line for f in filters):
+                                capture = True
+                            elif line.startswith("interface ") or line.startswith("!"):
+                                if capture and line.startswith("!"):
+                                    capture = False
+                            if capture:
+                                filtered.append(line)
+                        result = "\n".join(filtered)
+ 
+                    elif ("Administrative Mode:" in cmd and "spanning-tree portfast" in cmd and "\\n" in cmd):
+                        commands = [c.strip() for c in cmd.replace("\\n", "\n").split("\n") if c.strip()]
+                        print(f"\033[1;36m[*]\033[0m Running Security Audit on Switch...")
+ 
+                        if len(commands) >= 2:
+                            sw_out = netmiko_execute(commands[0], is_config=False)
+                            run_out = netmiko_execute(commands[1], is_config=False)
+                            status_out = netmiko_execute("show interfaces status", is_config=False)
+ 
+                            safe_ports, critical_ports = parse_safe_shutdown(sw_out, run_out, status_out)
+ 
+                            print(f"\n\033[1;36m{'='*50}\033[0m")
+                            print(f"  \033[1;36mSECURITY AUDIT RESULT\033[0m")
+                            print(f"\033[1;36m{'='*50}\033[0m")
+                            if critical_ports:
+                                print(f"  \033[1;31mCRITICAL\033[0m (has description): {', '.join(sorted(critical_ports))}")
                         
-                    if port_match:
-                        server_blocked = []
-                        switchport_out = netmiko_execute("show interfaces switchport | include Name:|Administrative", is_config=False)
-                        run_out = netmiko_execute("show run | section interface", is_config=False)
-                        status_out = netmiko_execute("show interfaces status", is_config=False)
-                        _, critical_ports = parse_safe_shutdown(switchport_out, run_out, status_out)
+                            if safe_ports:
+                                print(f"  \033[1;32mSAFE\033[0m to shutdown ({len(safe_ports)}): {', '.join(safe_ports)}")
+                                print(f"\033[1;36m{'='*50}\033[0m")
+ 
+                                confirm = input(f"\n[CONFIRM] Shutdown {len(safe_ports)} safe ports? (y/n): ")
+                                if confirm.lower() == 'y':
+                                    from collections import defaultdict
+                                    groups = defaultdict(list)
+                                    for p in safe_ports:
+                                        prefix, num = p.rsplit("/", 1)
+                                        groups[prefix].append(int(num))
+                                    ranges = []
+                                    for prefix in sorted(groups):
+                                        nums = sorted(groups[prefix])
+                                        start = end = nums[0]
+                                        for n in nums[1:]:
+                                            if n == end + 1:
+                                                end = n
+                                            else:
+                                                ranges.append(f"{prefix}/{start}" if start == end else f"{prefix}/{start}-{end}")
+                                                start = end = n
+                                        ranges.append(f"{prefix}/{start}" if start == end else f"{prefix}/{start}-{end}")
+                                
+                                    range_str = "interface range " + ",".join(ranges)
+                                    shut_cmd = f"{range_str}\\nshutdown"
+                                    result = netmiko_execute(shut_cmd, is_config=True) 
+                                    print(f"\033[1;37m[RESULT]\033[0m\n{result}")
+                                else:
+                                    print("\033[1;31m[CANCELLED]\033[0m")
+                            else:
+                                print(f"  \033[1;41mWARNING:\033[0m \033[1;31mNo safe ports found!\033[0m")
+                                print(f"  \033[1;33mAll ports are either Trunks, missing Portfast, or have description.\033[0m")
+                                print(f"\033[1;36m{'='*50}\033[0m")
+                        else:
+                            print("\033[1;31m[ERROR]\033[0m Could not parse 2 show commands.")
+                        continue
+ 
+                    else:
+                        result = netmiko_execute(cmd, is_config=False)
+ 
+                    print(f"\033[1;37m[RAW OUTPUT]\033[0m\n{result}")
+ 
+                    pre_summary = ""
+                    if "interfaces status" in cmd:
+                        disabled, connected, notconnect = [], [], []
+                        for line in result.splitlines():
+                            match = re.match(r'^(Fa|Gi|Te|Et)(\d+/\d+(/\d+)?)\s+', line.strip())
+                            if match:
+                                port = match.group(0).strip()
+                                if "disabled" in line: disabled.append(port)
+                                elif "connected" in line: connected.append(port)
+                                elif "notconnect" in line: notconnect.append(port)
+                        pre_summary = f"\nPARSED BY SYSTEM (accurate):\n- Disabled ({len(disabled)}): {', '.join(disabled)}\n- Connected ({len(connected)}): {', '.join(connected)}\n- Notconnect ({len(notconnect)}): {', '.join(notconnect)}\nUSE THESE NUMBERS. Do not recount."
+                
+                    if "processes cpu history" in cmd:
+                        # Replace ASCII graph with simple numbers
+                        simple_cpu = netmiko_execute("show processes cpu | include CPU", is_config=False)
+                        pre_summary = f"""
+                        [SYSTEM OVERRIDE - CRITICAL DATA]: 
+                        WARNING: As an AI, you cannot reliably parse ASCII graphs. 
+                        IGNORE the ASCII graph in the RAW CLI above. 
+                        STRICTLY USE these parsed numbers to analyze CPU load:
+                        >>> {simple_cpu.strip()} <<<
+                        """
+
+                    if not is_manually_corrected:
+                        ask_sum = input("\n[?] Do you want AI to summarize this result? (y/n): ")
+                        if ask_sum.lower() == 'y':
+                            if "processes cpu history" in cmd:
+                                dynamic_steps = "Analyze the CPU usage strictly using the [SYSTEM OVERRIDE] numbers. Report the CPU load trends (average and peaks) concisely."
+                            elif "interfaces status" in cmd:
+                                dynamic_steps = textwrap.dedent("""
+                                    [STRICT SYSTEM AUDIT]:
+                                    1. SCAN: Look at the 'Status' column for EVERY port.
+                                    2. LIST: List all ports marked 'connected' (DO NOT miss Fa0/1 Trunk).
+                                    3. COUNT: Sum the total for each status.
+                                
+                                    [OUTPUT FORMAT - FILL IN THE BLANKS]:
+                                    * [TOTAL_CONNECTED] ports are connected: [List ports with Descriptions, e.g., Fa0/1 (TRUNK), Fa0/9 (SERVER)]
+                                    * [TOTAL_DISABLED] ports are disabled: [Group port names, e.g., Fa0/2-8, Fa0/11-24]
+                                
+                                    [STRICT RULE]: No narrative. No 'Mapping' or 'Filtering' headers. Just the two lines above.
+                                """).strip()
+                            
+                            elif "running-config" in cmd:
+                                dynamic_steps = textwrap.dedent("""
+                                    1. SCANNING: Look at each 'interface' line.
+                                    2. VERIFICATION: Check if 'attach-policy' is immediately below.
+                                    - YES: PROTECTED.
+                                    - NO: VULNERABLE.
+                                    3. VLAN AUDIT: Identify VLANs with global policies.
+                                    [MANDATORY OUTPUT FORMAT]:
+                                    - PROTECTED PORTS: [List]
+                                    - GLOBAL PROTECTION: [List]
+                                    - SECURITY GAPS: [List ALL vulnerable ports]
+                                    - FHS STATUS: [Briefly mention RA Guard/Snooping]
+                                    """).strip()
+                            else:
+                                dynamic_steps = "Summarize the key information from the RAW CLI output concisely. Focus ONLY on what is actually present in the data."
                         
-                        for p in port_match:
-                            normalized = p[:2].capitalize() + p[2:]
-                            if normalized in critical_ports:
-                                server_blocked.append(normalized)
-                        
-                        if server_blocked:
-                            print(f"\n\033[1;41m[CRITICAL BLOCK]\033[0m \033[1;31mServer port(s) detected: {', '.join(server_blocked)}\033[0m")
-                            print("\033[1;31m[!]\033[0m \033[1;33mServer ports require manual CLI shutdown. BLOCKED regardless of --force or VERIFIED.\033[0m")
-                            print("\033[1;33m[TIP]\033[0m Connect via direct console/SSH for accountability.\033[0m")
+                            summary_prompt = f"""
+                            SUMMARY_MODE: The command has ALREADY been executed. Summarize RAW CLI output only.
+                            [ROLE]: Senior Forensic Network Auditor.
+                            [STRICT RULES]:
+                            - Do NOT use EXECUTE.
+                            - Do NOT suggest or repeat a show/config command.
+                            - Do NOT answer the original admin request.
+                            - Summarize only facts visible in RAW CLI.
+                     
+                            [INPUT]:
+                            - COMMAND ALREADY RUN: {cmd}
+                            - RAW CLI: {result[-2000:]}
+                            {pre_summary}
+                     
+                            [FORENSIC ANALYSIS STEPS]:
+                            {dynamic_steps}
+                    
+                            [LIMIT]: 5 lines max. No hallucinations. If a port has no config, it is NOT protected.
+                            """
+                     
+                            print("\n\033[1;36m[MIMIR IS ANALYZING SYSTEM LOGS...]\033[0m")
+                            summary = ask_ai(summary_prompt, silent=True, spinner_text="MIMIR is summarizing raw CLI output")
+                            if "execute:" in summary.lower():
+                                summary = local_cli_summary(cmd, result, pre_summary)
+                            stream_mimir_text(summary)
+                    else:
+                        print("\n\033[1;36m[INFO]\033[0m Manual correction applied. Skipping auto-summary to avoid repetition.")
+                        is_manually_corrected = False
+ 
+    # --- CONFIG COMMAND EXECUTION ---
+
+                else:
+                    if audit_context and "BLOCKED" in audit_context:
+                        print(f"\n\033[1;31m[AUTO-AUDIT BLOCK]\033[0m Cannot execute — audit found protected/trunk ports.")
+                        print(f"\033[1;34m[INFO]\033[0m Use --force to override audit (except trunk or critical ports).")
+                        if not has_force:
                             continue
 
-                # --- SECURE PORT OPEN WORKFLOW ---
-                vlan_match = re.search(r'switchport\s+access\s+vlan\s+(\d+)', cmd, re.IGNORECASE)
-                
-                cmd_lines = [l.strip() for l in cmd.replace("\\n", "\n").split("\n") if l.strip()]
-                is_complex = len(cmd_lines) > 4 or "authentication" in cmd or "storm-control" in cmd or "dhcp snooping" in cmd or "raguard" in cmd
-                
-                if vlan_match and not is_complex:
-                    target_vlan = vlan_match.group(1)
-                    remove_matches = re.findall(r'no\s+vlan\s+(\d+)', cmd, re.IGNORECASE)
-                    remove_vlans = [v for v in remove_matches if v != target_vlan]
+                    is_dangerous_trunk_cmd = (
+                        ("shutdown" in cmd.lower() and "no shutdown" not in cmd.lower()) or
+                        ("switchport mode" in cmd.lower() and "trunk" not in cmd.lower())
+                    )
+                    if is_dangerous_trunk_cmd:
+                        has_trunk, trunk_list = is_trunk_port(cmd)
+                        if has_trunk:
+                            print(f"\n\033[1;41m[CRITICAL BLOCK]\033[0m \033[1;31mTrunk port(s) detected: {', '.join(trunk_list)}\033[0m")
+                            print("\033[1;31m[!]\033[0m \033[1;33mShutdown trunk or Changing trunk mode = network isolation. BLOCKED regardless of --force or VERIFIED.\033[0m")
+                            continue
                     
-                    migrate_ports = extract_ports_from_input(cmd)
-                    if not migrate_ports:
-                        migrate_ports = extract_ports_from_input(user_input)
-                    
-                    if migrate_ports:
-                        print(f"\n\033[1;35m[VLAN MIGRATION]\033[0m {migrate_ports} → VLAN {target_vlan}")
-                        if remove_vlans:
-                            print(f"\033[1;33m[VLAN REMOVAL]\033[0m Will also remove: {remove_vlans}")
-                        vlan_migration_workflow(migrate_ports, target_vlan, has_force=has_force, remove_vlans=remove_vlans)
-                
-                        if "no shutdown" in cmd.lower():
-                            print(f"\n\033[1;36m[CHAIN]\033[0m Detected 'no shutdown' — chaining to Open Port Workflow...")
-                            open_port_workflow(migrate_ports, has_force=has_force)
+                        if audit_context and any(f"{p}" in audit_context and "CRITICAL" in audit_context for p in extract_ports_from_input(cmd)):
+                            print(f"\n\033[1;41m[CRITICAL BLOCK]\033[0m \033[1;31mServer port(s) detected (from prior audit)\033[0m")
+                            print("\033[1;31m[!]\033[0m \033[1;33mServer ports require manual CLI shutdown. BLOCKED.\033[0m")
+                            continue
+                        port_match = []
+                        matches = re.findall(r'(fa[a-z]*|gi[a-z]*|te[a-z]*|et[a-z]*)\s*(\d+(?:/\d+)?)/(\d+)(?:\s*(?:-|to)\s*(?:(?:fa[a-z]*|gi[a-z]*|te[a-z]*|et[a-z]*)\s*\d+(?:/\d+)?/)?(\d+))?', cmd, re.IGNORECASE)
+                        for match in matches:
+                            prefix = match[0][:2].capitalize()
+                            slot = match[1]
+                            start_port = int(match[2])
+                            if match[3]:
+                                end_port = int(match[3])
+                                for p in range(start_port, int(match[3])+1):
+                                    port_match.append(f"{prefix}{slot}/{p}")
+                            else:
+                                port_match.append(f"{prefix}{slot}/{start_port}")
                         
-                        continue
+                        if port_match:
+                            server_blocked = []
+                            switchport_out = netmiko_execute("show interfaces switchport | include Name:|Administrative", is_config=False)
+                            run_out = netmiko_execute("show run | section interface", is_config=False)
+                            status_out = netmiko_execute("show interfaces status", is_config=False)
+                            _, critical_ports = parse_safe_shutdown(switchport_out, run_out, status_out)
+                        
+                            for p in port_match:
+                                normalized = p[:2].capitalize() + p[2:]
+                                if normalized in critical_ports:
+                                    server_blocked.append(normalized)
+                        
+                            if server_blocked:
+                                print(f"\n\033[1;41m[CRITICAL BLOCK]\033[0m \033[1;31mServer port(s) detected: {', '.join(server_blocked)}\033[0m")
+                                print("\033[1;31m[!]\033[0m \033[1;33mServer ports require manual CLI shutdown. BLOCKED regardless of --force or VERIFIED.\033[0m")
+                                print("\033[1;33m[TIP]\033[0m Connect via direct console/SSH for accountability.\033[0m")
+                                continue
+
+                    # --- SECURE PORT OPEN WORKFLOW ---
+                    vlan_match = re.search(r'switchport\s+access\s+vlan\s+(\d+)', cmd, re.IGNORECASE)
                 
-                if "no shutdown" in cmd.lower():
-                    open_ports = extract_ports_from_input(cmd)
+                    cmd_lines = [l.strip() for l in cmd.replace("\\n", "\n").split("\n") if l.strip()]
+                    is_complex = len(cmd_lines) > 4 or "authentication" in cmd or "storm-control" in cmd or "dhcp snooping" in cmd or "raguard" in cmd
+                
+                    if vlan_match and not is_complex:
+                        target_vlan = vlan_match.group(1)
+                        remove_matches = re.findall(r'no\s+vlan\s+(\d+)', cmd, re.IGNORECASE)
+                        remove_vlans = [v for v in remove_matches if v != target_vlan]
                     
-                    if not open_ports:
-                        open_ports = extract_ports_from_input(user_input)
+                        migrate_ports = extract_ports_from_input(cmd)
+                        if not migrate_ports:
+                            migrate_ports = extract_ports_from_input(user_input)
                     
-                    if open_ports:
-                        print(f"\n\033[1;35m[SECURE OPEN]\033[0m Detected port open request: \033[1;33m{open_ports}\033[0m")
-                        print("\033[1;35m[SECURE OPEN]\033[0m Routing through Secure Port Open Workflow...")
-                        open_port_workflow(open_ports, has_force=has_force)
-                        continue
+                        if migrate_ports:
+                            print(f"\n\033[1;35m[VLAN MIGRATION]\033[0m {migrate_ports} → VLAN {target_vlan}")
+                            if remove_vlans:
+                                print(f"\033[1;33m[VLAN REMOVAL]\033[0m Will also remove: {remove_vlans}")
+                            vlan_migration_workflow(migrate_ports, target_vlan, has_force=has_force, remove_vlans=remove_vlans)
+                
+                            if "no shutdown" in cmd.lower():
+                                print(f"\n\033[1;36m[CHAIN]\033[0m Detected 'no shutdown' — chaining to Open Port Workflow...")
+                                open_port_workflow(migrate_ports, has_force=has_force)
+                        
+                            continue
+                
+                    if "no shutdown" in cmd.lower():
+                        open_ports = extract_ports_from_input(cmd)
+                    
+                        if not open_ports:
+                            open_ports = extract_ports_from_input(user_input)
+                    
+                        if open_ports:
+                            print(f"\n\033[1;35m[SECURE OPEN]\033[0m Detected port open request: \033[1;33m{open_ports}\033[0m")
+                            print("\033[1;35m[SECURE OPEN]\033[0m Routing through Secure Port Open Workflow...")
+                            open_port_workflow(open_ports, has_force=has_force)
+                            continue
+                        else:
+                            print("\033[1;33m[!]\033[0m Could not extract ports from command. Proceeding with raw execute.")
+
+                    is_conf = not cmd.startswith(("show", "ping", "traceroute", "clear", "terminal"))
+
+                    if has_force:
+                        print(f"\033[1;35m[FORCE]\033[0m Auto-executing: {cmd}")
+                        confirm = 'y'
                     else:
-                        print("\033[1;33m[!]\033[0m Could not extract ports from command. Proceeding with raw execute.")
-
-                is_conf = not cmd.startswith(("show", "ping", "traceroute", "clear", "terminal"))
-
-                if has_force:
-                    print(f"\033[1;35m[FORCE]\033[0m Auto-executing: {cmd}")
-                    confirm = 'y'
-                else:
-                    confirm = input(f"[CONFIRM] Execute '{cmd}'? (y/n): ")
+                        confirm = input(f"[CONFIRM] Execute '{cmd}'? (y/n): ")
                 
-                if confirm.lower() == 'y':
-                    result = netmiko_execute(cmd, is_config=is_conf)
-                    print(f"\033[1;37m[RESULT]\033[0m\n{result}")
-                else:
-                    print("[CANCELLED]")
-        else:
-            pass
+                    if confirm.lower() == 'y':
+                        result = netmiko_execute(cmd, is_config=is_conf)
+                        print(f"\033[1;37m[RESULT]\033[0m\n{result}")
+                    else:
+                        print("[CANCELLED]")
+            else:
+                pass
  
-    except KeyboardInterrupt:
-        print("\n👋 \033[1;30mGoodbye.\033[0m")
-        break
+        except KeyboardInterrupt:
+            print("\n👋 \033[1;30mGoodbye.\033[0m")
+            break
 
-    except Exception as e:
-        print("\n" + "="*50)
-        print("\033[1;31m[CRASH DETECTED]\033[0m")
-        traceback.print_exc()
-        print("="*50)
-        input("\n[!] CMD IS BEING HOLD...")
+        except Exception as e:
+            print("\n" + "="*50)
+            print("\033[1;31m[CRASH DETECTED]\033[0m")
+            traceback.print_exc()
+            print("="*50)
+            input("\n[!] CMD IS BEING HOLD...")
+
+
+if __name__ == "__main__":
+    main()
