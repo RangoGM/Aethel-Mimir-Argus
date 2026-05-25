@@ -1052,7 +1052,6 @@ def main():
                                         event_buffer.append(f"{time.strftime('%H:%M:%S')} | DAI {port_dai} | SKIP - low rate ({rate:.1f}/min)")
                                         continue
                                     else:
-                                        # Trên 5 drop/phút = real attack
                                         print(f"[FILTER] DAI {port_dai} | delta={delta}, rate={rate:.1f}/min. ATTACK -> AI.")
                                 else:
                                     print(f"[FILTER] DAI {port_dai} | First baseline={current_drop}. Monitor.")
