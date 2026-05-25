@@ -10,8 +10,12 @@ from netmiko import ConnectHandler, redispatch
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WHITELIST_FILE = os.path.join(SCRIPT_DIR, "scan_whitelist.json")
+RA_DEDUPE_WINDOW_S = 10
+RA_RESET_QUIET_SECONDS = 30
+DAI_RATE_THRESHOLD_PER_MIN = 5
+NOTCONNECT_COUNTDOWN_S = 60
 
-def parse_switch_time(raw_log, current_year=2026):
+def parse_switch_time(raw_log, current_year=None):
     """Parse Cisco timestamp 'Apr 28 20:24:04.019' → epoch seconds"""
     m = re.search(r'(\w{3})\s+(\d+)\s+(\d{2}):(\d{2}):(\d{2})\.(\d{3})', raw_log)
     if not m:
@@ -21,6 +25,9 @@ def parse_switch_time(raw_log, current_year=2026):
               'Jul':7,'Aug':8,'Sep':9,'Oct':10,'Nov':11,'Dec':12}
     
     try:
+        if current_year is None:
+            current_year = datetime.datetime.now().year
+
         dt = datetime.datetime(
             year=current_year,
             month=months[m.group(1)],
@@ -30,8 +37,13 @@ def parse_switch_time(raw_log, current_year=2026):
             second=int(m.group(5)),
             microsecond=int(m.group(6)) * 1000
         )
+        if dt - datetime.datetime.now() > datetime.timedelta(days=30):
+            try:
+                dt = dt.replace(year=dt.year - 1)
+            except ValueError:
+                dt = dt.replace(year=dt.year - 1, day=28)
         return dt.timestamp()
-    except:
+    except Exception:
         return None
 
 
@@ -45,7 +57,7 @@ def parse_loki_time(raw_log):
         ts_str = m.group(1)[:26]
         dt = datetime.datetime.fromisoformat(ts_str)
         return dt.timestamp()
-    except:
+    except Exception:
         return None
 
 def save_security_dataset(instruction, output):
@@ -126,7 +138,7 @@ def netmiko_execute(command, is_config=False):
             try:
                 conn_params['ssh_extra_args'] = SSH_LEGACY
                 jump = ConnectHandler(**conn_params)
-            except:
+            except Exception:
                 if 'ssh_extra_args' in conn_params:
                     del conn_params['ssh_extra_args']
                 jump = ConnectHandler(**conn_params)
@@ -179,7 +191,7 @@ def verify_trunk_cdp_identity(port, expected_name=""):
                     return True, neighbor_name
         
         return False, None
-    except:
+    except Exception:
         return False, None
  
 # --- [3.5] PORT SCANNER + DAI TRACKER + COUNTER MEMORY + ROLLBACK ---
@@ -206,7 +218,7 @@ def is_trunk_port(port_name):
     try:
         out = netmiko_execute(f"show interfaces {port_name} switchport", is_config=False)
         return "Administrative Mode: trunk" in out
-    except: return False
+    except Exception: return False
  
 def scan_ports():
     with LoadingSpinner("\033[1;32m[ARGUS]\033[0m Scanning interfaces status"):
@@ -310,6 +322,28 @@ def get_prev_counter(port, category):
 shutdown_log = []  # -> NEVER cleared, full history
 rollback_whitelist = set()  # -> Port admin rollback, scan will not touch
 
+def _atomic_json_write(path, data):
+    """Write JSON atomically: per-writer tmp + fsync + os.replace.
+    The tmp filename includes PID + thread id so concurrent writers
+    (MIMIR + ARGUS, or multiple threads) never collide on the staging file.
+    Final-file semantics are still last-writer-wins on os.replace; this
+    helper guarantees no torn/half-written JSON, not lost-update protection."""
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        # Best-effort cleanup if write/replace failed partway
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+        raise
+
 def load_maintenance_whitelist():
     """Load whitelist entries from JSON shared with admin script"""
     if not os.path.exists(WHITELIST_FILE):
@@ -317,13 +351,12 @@ def load_maintenance_whitelist():
     try:
         with open(WHITELIST_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
+    except Exception:
         return []
  
 def save_maintenance_whitelist(entries):
-    """Save updated whitelist"""
-    with open(WHITELIST_FILE, "w", encoding="utf-8") as f:
-        json.dump(entries, f, indent=2)
+    """Save updated whitelist (atomic write)"""
+    _atomic_json_write(WHITELIST_FILE, entries)
  
 def cleanup_expired_whitelist():
     """Remove expired entries, return active ones"""
@@ -366,7 +399,7 @@ def check_dot1x_auth_in_logs(port):
             for _, line in stream['values']:
                 if p in line:
                     return True
-    except:
+    except Exception:
         pass
     return False
  
@@ -383,7 +416,7 @@ def load_seen_ts():
     try:
         with open(TS_FILE, 'r') as f:
             return set(f.read().strip().split("\n"))
-    except:
+    except Exception:
         return set()
  
 def save_seen_ts():
@@ -391,7 +424,7 @@ def save_seen_ts():
         recent = sorted(seen_timestamps)[-200:]
         with open(TS_FILE, 'w') as f:
             f.write("\n".join(recent))
-    except:
+    except Exception:
         pass
  
 seen_timestamps = load_seen_ts()
@@ -663,7 +696,7 @@ def initialize_ra_baselines():
                 try:
                     conn_params['ssh_extra_args'] = SSH_LEGACY
                     jump = ConnectHandler(**conn_params)
-                except:
+                except Exception:
                     if 'ssh_extra_args' in conn_params:
                         del conn_params['ssh_extra_args']
                     jump = ConnectHandler(**conn_params)
@@ -744,15 +777,13 @@ def initialize_ra_baselines():
         if jump:
             try:
                 jump.disconnect()
-            except:
+            except Exception:
                 pass
 
-
-print_argus_banner()
-initialize_ra_baselines()
-
 POLICY_RESCAN_INTERVAL = 300
-last_policy_check = time.time()
+last_policy_check = 0
+baseline_ra_ports = set()
+drift_alert_count = {}
 
 def get_known_ra_ports():
     """Extract RA Guard port list from prev_counters (ports that have RA_GUARD baseline)"""
@@ -762,11 +793,6 @@ def get_known_ra_ports():
             port = key.replace("_RA_GUARD", "")
             ports.add(port)
     return ports
-
-baseline_ra_ports = get_known_ra_ports()
-drift_alert_count = {}
-if baseline_ra_ports:
-    print(f"\033[1;36m[RESCAN]\033[0m Tracking {len(baseline_ra_ports)} RA Guard ports for drift detection: {sorted(baseline_ra_ports)}")
 
 def rescan_ra_policies():
     """Periodic rescan: detect removed/added RA Guard policies"""
@@ -794,7 +820,7 @@ def rescan_ra_policies():
                     event_buffer.append(f"{time.strftime('%H:%M:%S')} | POLICY DRIFT REMOVED {port} (rescan)")
                     try:
                         send_report(f"CRITICAL: RA Guard policy removed from {port} (detected by periodic rescan) | FACILITY: DANGER")
-                    except:
+                    except Exception:
                         pass
                     drift_alert_count[port] = count + 1
         
@@ -838,442 +864,455 @@ def rescan_ra_policies():
     except Exception as e:
         print(f"\033[1;31m[RESCAN ERROR]\033[0m {e}")
 
- 
-while True:
-    try:
-        res = requests.get(LOKI_URL, params={
-            'query': LOKI_QUERY,
-            'limit': 20,
-            'start': str(int((time.time() - 30) * 1e9))
-        }, timeout=5).json()
- 
-        if res['data']['result']:
-            cached_binding = None
-            cached_counters = {}
- 
-            for stream in res['data']['result']:
-                for current_ts, raw_log in stream['values']:
-                    if current_ts in seen_timestamps:
-                        continue
-                    seen_timestamps.add(current_ts)
-                    save_seen_ts()
- 
-                    print(f"\n[!] LOG DETECTED: {raw_log[:100]}...")
+def main():
+    global baseline_ra_ports, drift_alert_count, last_policy_check, last_report_time, last_scan_time
+    print_argus_banner()
+    initialize_ra_baselines()
+    last_policy_check = time.time()
+    baseline_ra_ports = get_known_ra_ports()
+    drift_alert_count = {}
+    if baseline_ra_ports:
+        print(f"\033[1;36m[RESCAN]\033[0m Tracking {len(baseline_ra_ports)} RA Guard ports for drift detection: {sorted(baseline_ra_ports)}")
 
-                    if "AUTHMGR-5-SUCCESS" in raw_log or "MAB-5-SUCCESS" in raw_log:
-                        maint_entries = load_maintenance_whitelist()
-                        for entry in maint_entries:
-                            if entry["mode"] == "access" and not entry["verified"]:
-                                    if check_dot1x_auth_in_logs(entry["port"]):
-                                        print(f"\n[802.1X] [SUCCESS] {entry['port']} — Admin authenticated via 802.1X!")
-                                        print(f"[802.1X] Port verified. Maintenance continues.")
-                                        entry["verified"] = True
-                                        save_maintenance_whitelist(maint_entries)
-                                        event_buffer.append(f"{time.strftime('%H:%M:%S')} | 802.1X VERIFIED: {entry['port']}")
-                                        break
+    while True:
+        try:
+            res = requests.get(LOKI_URL, params={
+                'query': LOKI_QUERY,
+                'limit': 20,
+                'start': str(int((time.time() - 30) * 1e9))
+            }, timeout=5).json()
+ 
+            if res['data']['result']:
+                cached_binding = None
+                cached_counters = {}
+ 
+                for stream in res['data']['result']:
+                    for current_ts, raw_log in stream['values']:
+                        if current_ts in seen_timestamps:
+                            continue
+                        seen_timestamps.add(current_ts)
+                        save_seen_ts()
+ 
+                        print(f"\n[!] LOG DETECTED: {raw_log[:100]}...")
+
+                        if "AUTHMGR-5-SUCCESS" in raw_log or "MAB-5-SUCCESS" in raw_log:
+                            maint_entries = load_maintenance_whitelist()
+                            for entry in maint_entries:
+                                if entry["mode"] == "access" and not entry["verified"]:
+                                        if check_dot1x_auth_in_logs(entry["port"]):
+                                            print(f"\n[802.1X] [SUCCESS] {entry['port']} — Admin authenticated via 802.1X!")
+                                            print(f"[802.1X] Port verified. Maintenance continues.")
+                                            entry["verified"] = True
+                                            save_maintenance_whitelist(maint_entries)
+                                            event_buffer.append(f"{time.strftime('%H:%M:%S')} | 802.1X VERIFIED: {entry['port']}")
+                                            break
                     
-                    if "SISF-4-PAK_DROP" in raw_log and "NDP::RA" in raw_log:
-                        ra_port = ""
-                        ra_m = re.search(r'I=(Fa|Gi)\d+/\d+', raw_log, re.IGNORECASE)
-                        if ra_m:
-                            ra_port = ra_m.group(0).replace("I=", "")
+                        if "SISF-4-PAK_DROP" in raw_log and "NDP::RA" in raw_log:
+                            ra_port = ""
+                            ra_m = re.search(r'I=(Fa|Gi)\d+/\d+', raw_log, re.IGNORECASE)
+                            if ra_m:
+                                ra_port = ra_m.group(0).replace("I=", "")
                         
-                        if ra_port:
-                            last_check = get_prev_counter(ra_port, "RA_LAST_CHECK")
-                            if last_check and (time.time() - float(last_check)) < 10:
-                                continue
-                            save_counter(ra_port, "RA_LAST_CHECK", str(time.time()))
-                            
-                            vlan_m = re.search(r'V=(\d+)', raw_log)
-                            vlan_id = vlan_m.group(1) if vlan_m else "10"
-                            
-                            ra_counter_out = netmiko_execute(f"show ipv6 snooping counters interface {ra_port}", is_config=False)
-                            
-                            if "no ipv6 snooping policy attached" in ra_counter_out.lower():
-                                print(f"\033[1;31m[POLICY DRIFT]\033[0m RA Guard {ra_port} | Policy REMOVED — port unprotected!")
-                                event_buffer.append(f"{time.strftime('%H:%M:%S')} | POLICY DRIFT REMOVED {ra_port}")
-                                save_security_dataset(f"NEW_LOG: {raw_log}", f"STEP: ESCALATE | ACTION: none | MSG: RA Guard policy removed from {ra_port}. Port unprotected. Admin attention required.")
-                                try:
-                                    send_report(f"⚠️ RA Guard policy removed from {ra_port} — port unprotected!")
-                                except:
-                                    pass
-                                continue
-                            
-                            drop_match = re.search(r'RA\s+guard\s+NDP\s+RA\s+\[(\d+)\]', ra_counter_out, re.IGNORECASE)
-                            current_drops = int(drop_match.group(1)) if drop_match else 0
-                            
-                            prev_ra = get_prev_counter(ra_port, "RA_GUARD")
-                            prev_time = get_prev_counter(ra_port, "RA_GUARD_TIME")
-                            
-                            if prev_ra is None:
-                                save_counter(ra_port, "RA_GUARD", str(current_drops))
-                                save_counter(ra_port, "RA_GUARD_TIME", str(time.time()))
-                                print(f"[FILTER] RA Guard {ra_port} | VLAN {vlan_id} | Baseline={current_drops}. Hardware blocking.")
-                                event_buffer.append(f"{time.strftime('%H:%M:%S')} | RA {ra_port} | baseline={current_drops} | HW blocking")
-                                save_security_dataset(f"NEW_LOG: {raw_log}", f"STEP: MITIGATE | ACTION: none | MSG: RA Guard baseline={current_drops}. Hardware blocking. Monitor.")
-                            else:
-                                delta = current_drops - int(prev_ra)
-                                elapsed = time.time() - float(prev_time) if prev_time else 0
-
-                                sw_time = parse_switch_time(raw_log)
-                                loki_time = parse_loki_time(raw_log)
-                                latency_ms = None
-                                if sw_time and loki_time:
-                                    latency_ms = (loki_time - sw_time) * 1000
-                                
-                                if delta == 0 and elapsed > 30:
-                                    save_counter(ra_port, "RA_GUARD", str(current_drops))
-                                    save_counter(ra_port, "RA_GUARD_TIME", str(time.time()))
-                                    print(f"[FILTER] RA Guard {ra_port} | Reset baseline={current_drops} (attack quiet >30s).")
-                                    event_buffer.append(f"{time.strftime('%H:%M:%S')} | RA {ra_port} | Reset baseline")
+                            if ra_port:
+                                last_check = get_prev_counter(ra_port, "RA_LAST_CHECK")
+                                if last_check and (time.time() - float(last_check)) < RA_DEDUPE_WINDOW_S:
                                     continue
-                                
-                                if delta >= 1:
-                                    latency_str = f" | latency={latency_ms:.0f}ms" if latency_ms else ""
-                                    print(f"[WARNING] RA Guard {ra_port} | VLAN {vlan_id} | delta={delta} | Sustained Rogue RA!")
-                                    print(f"[CORRELATION] Syslog vs HW counter: drops={current_drops}, delta={delta}{latency_str}")
-                                    print(f"[INFO] RA Guard hardware blocking. No shutdown needed.")
-
+                                save_counter(ra_port, "RA_LAST_CHECK", str(time.time()))
+                            
+                                vlan_m = re.search(r'V=(\d+)', raw_log)
+                                vlan_id = vlan_m.group(1) if vlan_m else "10"
+                            
+                                ra_counter_out = netmiko_execute(f"show ipv6 snooping counters interface {ra_port}", is_config=False)
+                            
+                                if "no ipv6 snooping policy attached" in ra_counter_out.lower():
+                                    print(f"\033[1;31m[POLICY DRIFT]\033[0m RA Guard {ra_port} | Policy REMOVED — port unprotected!")
+                                    event_buffer.append(f"{time.strftime('%H:%M:%S')} | POLICY DRIFT REMOVED {ra_port}")
+                                    save_security_dataset(f"NEW_LOG: {raw_log}", f"STEP: ESCALATE | ACTION: none | MSG: RA Guard policy removed from {ra_port}. Port unprotected. Admin attention required.")
                                     try:
-                                        with open("latency_log.csv", "a") as f:
-                                            f.write(f"{time.time()},{ra_port},{delta},{current_drops},{latency_ms or 'NA'}\n")
-                                    except:
+                                        send_report(f"⚠️ RA Guard policy removed from {ra_port} — port unprotected!")
+                                    except Exception:
                                         pass
-
-                                    event_buffer.append(f"{time.strftime('%H:%M:%S')} | RA WARNING {ra_port} | delta={delta} | HW drops={current_drops}")
-                                    save_security_dataset(f"NEW_LOG: {raw_log}", f"STEP: MITIGATE | ACTION: none | MSG: RA Guard HW blocking. Delta={delta}, drops={current_drops}.")
-                                    save_counter(ra_port, "RA_GUARD_TIME", str(time.time()))
-                                else:
+                                    continue
+                            
+                                drop_match = re.search(r'RA\s+guard\s+NDP\s+RA\s+\[(\d+)\]', ra_counter_out, re.IGNORECASE)
+                                current_drops = int(drop_match.group(1)) if drop_match else 0
+                            
+                                prev_ra = get_prev_counter(ra_port, "RA_GUARD")
+                                prev_time = get_prev_counter(ra_port, "RA_GUARD_TIME")
+                            
+                                if prev_ra is None:
                                     save_counter(ra_port, "RA_GUARD", str(current_drops))
                                     save_counter(ra_port, "RA_GUARD_TIME", str(time.time()))
-                                    print(f"[FILTER] RA Guard {ra_port} | delta={delta}. Stale log.")
-                        continue
- 
-                    dai_match = re.search(r'Invalid ARPs', raw_log)
-                    if dai_match:
-                        if cached_binding is None:
-                            cached_binding = netmiko_execute("show ip dhcp snooping binding", is_config=False)
-                        port_dai = ""
-                        pm = re.search(r'(Gi|Fa)\d+/\d+', raw_log, re.IGNORECASE)
-                        if pm:
-                            port_dai = pm.group(0)
- 
-                        dai_result = check_dai_attack(port_dai, cached_binding)
- 
-                        if dai_result == 'ignored':
-                            print(f"[FILTER] DAI {port_dai} | Already flagged to admin. Skip.")
+                                    print(f"[FILTER] RA Guard {ra_port} | VLAN {vlan_id} | Baseline={current_drops}. Hardware blocking.")
+                                    event_buffer.append(f"{time.strftime('%H:%M:%S')} | RA {ra_port} | baseline={current_drops} | HW blocking")
+                                    save_security_dataset(f"NEW_LOG: {raw_log}", f"STEP: MITIGATE | ACTION: none | MSG: RA Guard baseline={current_drops}. Hardware blocking. Monitor.")
+                                else:
+                                    delta = current_drops - int(prev_ra)
+                                    elapsed = time.time() - float(prev_time) if prev_time else 0
+
+                                    sw_time = parse_switch_time(raw_log)
+                                    loki_time = parse_loki_time(raw_log)
+                                    latency_ms = None
+                                    if sw_time and loki_time:
+                                        latency_ms = (loki_time - sw_time) * 1000
+                                
+                                    if delta == 0 and elapsed > RA_RESET_QUIET_SECONDS:
+                                        save_counter(ra_port, "RA_GUARD", str(current_drops))
+                                        save_counter(ra_port, "RA_GUARD_TIME", str(time.time()))
+                                        print(f"[FILTER] RA Guard {ra_port} | Reset baseline={current_drops} (attack quiet >{RA_RESET_QUIET_SECONDS}s).")
+                                        event_buffer.append(f"{time.strftime('%H:%M:%S')} | RA {ra_port} | Reset baseline")
+                                        continue
+                                
+                                    if delta >= 1:
+                                        latency_str = f" | latency={latency_ms:.0f}ms" if latency_ms else ""
+                                        print(f"[WARNING] RA Guard {ra_port} | VLAN {vlan_id} | delta={delta} | Sustained Rogue RA!")
+                                        print(f"[CORRELATION] Syslog vs HW counter: drops={current_drops}, delta={delta}{latency_str}")
+                                        print(f"[INFO] RA Guard hardware blocking. No shutdown needed.")
+
+                                        try:
+                                            with open("latency_log.csv", "a") as f:
+                                                f.write(f"{time.time()},{ra_port},{delta},{current_drops},{latency_ms or 'NA'}\n")
+                                        except Exception:
+                                            pass
+
+                                        event_buffer.append(f"{time.strftime('%H:%M:%S')} | RA WARNING {ra_port} | delta={delta} | HW drops={current_drops}")
+                                        save_security_dataset(f"NEW_LOG: {raw_log}", f"STEP: MITIGATE | ACTION: none | MSG: RA Guard HW blocking. Delta={delta}, drops={current_drops}.")
+                                        save_counter(ra_port, "RA_GUARD_TIME", str(time.time()))
+                                    else:
+                                        save_counter(ra_port, "RA_GUARD", str(current_drops))
+                                        save_counter(ra_port, "RA_GUARD_TIME", str(time.time()))
+                                        print(f"[FILTER] RA Guard {ra_port} | delta={delta}. Stale log.")
                             continue
-                        elif dai_result == 'boot':
-                            elapsed = time.time() - dai_first_seen.get(port_dai, time.time())
-                            print(f"[FILTER] DAI {port_dai} | No lease, {elapsed:.0f}s/{BOOT_GRACE}s grace. Skip.")
-                            event_buffer.append(f"{time.strftime('%H:%M:%S')} | DAI {port_dai} | SKIP - boot grace")
-                            save_security_dataset(f"NEW_LOG: {raw_log}", "STEP: MITIGATE | ACTION: none | MSG: No lease, boot grace period. Monitor.")
-                            continue
-                        elif dai_result == 'stuck':
-                            print(f"[FILTER] DAI {port_dai} | No lease after 3min. Device stuck. Notify admin.")
-                            event_buffer.append(f"{time.strftime('%H:%M:%S')} | DAI {port_dai} | STUCK - no lease after 3min, possible device issue. Admin check required.")
-                            save_security_dataset(f"NEW_LOG: {raw_log}", "STEP: MITIGATE | ACTION: none | MSG: No lease after 3min. Device stuck. Notify admin.")
-                            dai_ignored_ports.add(port_dai)
-                            if port_dai in dai_first_seen:
-                                del dai_first_seen[port_dai]
-                            continue
-                        elif dai_result == 'verify':
-                            vlan_match = re.search(r'vlan (\d+)', raw_log)
-                            vlan_id = vlan_match.group(1) if vlan_match else "10"
+ 
+                        dai_match = re.search(r'Invalid ARPs', raw_log)
+                        if dai_match:
+                            if cached_binding is None:
+                                cached_binding = netmiko_execute("show ip dhcp snooping binding", is_config=False)
+                            port_dai = ""
+                            pm = re.search(r'(Gi|Fa)\d+/\d+', raw_log, re.IGNORECASE)
+                            if pm:
+                                port_dai = pm.group(0)
+ 
+                            dai_result = check_dai_attack(port_dai, cached_binding)
+ 
+                            if dai_result == 'ignored':
+                                print(f"[FILTER] DAI {port_dai} | Already flagged to admin. Skip.")
+                                continue
+                            elif dai_result == 'boot':
+                                elapsed = time.time() - dai_first_seen.get(port_dai, time.time())
+                                print(f"[FILTER] DAI {port_dai} | No lease, {elapsed:.0f}s/{BOOT_GRACE}s grace. Skip.")
+                                event_buffer.append(f"{time.strftime('%H:%M:%S')} | DAI {port_dai} | SKIP - boot grace")
+                                save_security_dataset(f"NEW_LOG: {raw_log}", "STEP: MITIGATE | ACTION: none | MSG: No lease, boot grace period. Monitor.")
+                                continue
+                            elif dai_result == 'stuck':
+                                print(f"[FILTER] DAI {port_dai} | No lease after 3min. Device stuck. Notify admin.")
+                                event_buffer.append(f"{time.strftime('%H:%M:%S')} | DAI {port_dai} | STUCK - no lease after 3min, possible device issue. Admin check required.")
+                                save_security_dataset(f"NEW_LOG: {raw_log}", "STEP: MITIGATE | ACTION: none | MSG: No lease after 3min. Device stuck. Notify admin.")
+                                dai_ignored_ports.add(port_dai)
+                                if port_dai in dai_first_seen:
+                                    del dai_first_seen[port_dai]
+                                continue
+                            elif dai_result == 'verify':
+                                vlan_match = re.search(r'vlan (\d+)', raw_log)
+                                vlan_id = vlan_match.group(1) if vlan_match else "10"
 
-                            if vlan_id not in cached_counters:
-                                cached_counters[vlan_id] = netmiko_execute(f"show ip arp inspection statistics vlan {vlan_id}", is_config=False)
-                            counter_output = cached_counters[vlan_id]
+                                if vlan_id not in cached_counters:
+                                    cached_counters[vlan_id] = netmiko_execute(f"show ip arp inspection statistics vlan {vlan_id}", is_config=False)
+                                counter_output = cached_counters[vlan_id]
 
-                            drop_match = re.search(r'\d+\s+\d+\s+(\d+)\s+\d+\s+\d+', counter_output)
-                            current_drop = int(drop_match.group(1)) if drop_match else 0
+                                drop_match = re.search(r'\d+\s+\d+\s+(\d+)\s+\d+\s+\d+', counter_output)
+                                current_drop = int(drop_match.group(1)) if drop_match else 0
 
-                            prev_drop = get_prev_counter(port_dai, "ARP_SPOOF")
-                            prev_time = get_prev_counter(port_dai, "ARP_SPOOF_TIME")
+                                prev_drop = get_prev_counter(port_dai, "ARP_SPOOF")
+                                prev_time = get_prev_counter(port_dai, "ARP_SPOOF_TIME")
 
-                            if prev_drop is not None:
-                                delta = current_drop - int(prev_drop)
-                                elapsed = time.time() - float(prev_time) if prev_time else 1
+                                if prev_drop is not None:
+                                    delta = current_drop - int(prev_drop)
+                                    elapsed = time.time() - float(prev_time) if prev_time else 1
 
-                                # Rate = delta per minute
-                                rate = (delta / elapsed) * 60 if elapsed > 0 else 0
+                                    # Rate = delta per minute
+                                    rate = (delta / elapsed) * 60 if elapsed > 0 else 0
 
-                                save_counter(port_dai, "ARP_SPOOF", str(current_drop))
-                                save_counter(port_dai, "ARP_SPOOF_TIME", str(time.time()))
-                                if vlan_id in cached_counters:
-                                    del cached_counters[vlan_id]
-
-                                if delta <= 0:
-                                    print(f"[FILTER] DAI {port_dai} | delta={delta}. Stale log. Skip.")
                                     save_counter(port_dai, "ARP_SPOOF", str(current_drop))
+                                    save_counter(port_dai, "ARP_SPOOF_TIME", str(time.time()))
                                     if vlan_id in cached_counters:
                                         del cached_counters[vlan_id]
-                                    event_buffer.append(f"{time.strftime('%H:%M:%S')} | DAI {port_dai} | SKIP - stale (delta={delta})")
-                                    save_security_dataset(f"NEW_LOG: {raw_log}", f"STEP: MITIGATE | ACTION: none | MSG: Counter delta={delta}. Stale log.")
-                                    continue
-                                elif rate < 5:
-                                    # Below 5 drop/minutes = Boot or renewal
-                                    print(f"[FILTER] DAI {port_dai} | delta={delta}, rate={rate:.1f}/min. Normal ARP. Skip.")
-                                    event_buffer.append(f"{time.strftime('%H:%M:%S')} | DAI {port_dai} | SKIP - low rate ({rate:.1f}/min)")
-                                    continue
+
+                                    if delta <= 0:
+                                        print(f"[FILTER] DAI {port_dai} | delta={delta}. Stale log. Skip.")
+                                        save_counter(port_dai, "ARP_SPOOF", str(current_drop))
+                                        if vlan_id in cached_counters:
+                                            del cached_counters[vlan_id]
+                                        event_buffer.append(f"{time.strftime('%H:%M:%S')} | DAI {port_dai} | SKIP - stale (delta={delta})")
+                                        save_security_dataset(f"NEW_LOG: {raw_log}", f"STEP: MITIGATE | ACTION: none | MSG: Counter delta={delta}. Stale log.")
+                                        continue
+                                    elif rate < DAI_RATE_THRESHOLD_PER_MIN:
+                                        # Below threshold = boot or renewal
+                                        print(f"[FILTER] DAI {port_dai} | delta={delta}, rate={rate:.1f}/min. Normal ARP. Skip.")
+                                        event_buffer.append(f"{time.strftime('%H:%M:%S')} | DAI {port_dai} | SKIP - low rate ({rate:.1f}/min)")
+                                        continue
+                                    else:
+                                        # Trên 5 drop/phút = real attack
+                                        print(f"[FILTER] DAI {port_dai} | delta={delta}, rate={rate:.1f}/min. ATTACK -> AI.")
                                 else:
-                                    # Trên 5 drop/phút = real attack
-                                    print(f"[FILTER] DAI {port_dai} | delta={delta}, rate={rate:.1f}/min. ATTACK -> AI.")
-                            else:
-                                print(f"[FILTER] DAI {port_dai} | First baseline={current_drop}. Monitor.")
-                                save_counter(port_dai, "ARP_SPOOF", str(current_drop))
-                                save_counter(port_dai, "ARP_SPOOF_TIME", str(time.time()))
-                                if vlan_id in cached_counters:
-                                    del cached_counters[vlan_id]
-                                event_buffer.append(f"{time.strftime('%H:%M:%S')} | DAI {port_dai} | First baseline={current_drop}. Monitor.")
+                                    print(f"[FILTER] DAI {port_dai} | First baseline={current_drop}. Monitor.")
+                                    save_counter(port_dai, "ARP_SPOOF", str(current_drop))
+                                    save_counter(port_dai, "ARP_SPOOF_TIME", str(time.time()))
+                                    if vlan_id in cached_counters:
+                                        del cached_counters[vlan_id]
+                                    event_buffer.append(f"{time.strftime('%H:%M:%S')} | DAI {port_dai} | First baseline={current_drop}. Monitor.")
+                                    continue
+ 
+                        # --- AI INVESTIGATE ---
+                        investigate_prompt = f"NEW_LOG: {sanitize_log(raw_log)}. Request investigation command."
+                        ai_req = ask_ai(investigate_prompt)
+ 
+                        if "INVESTIGATE" in ai_req:
+                            if "| CMD: " not in ai_req:
+                                print(f"[X] AI format error, skip: {ai_req}")
+                                continue
+                            save_security_dataset(investigate_prompt, ai_req)
+ 
+                            cmd = ai_req.split("| CMD: ")[1].split("|")[0].strip()
+
+                            cmds = [c.strip() for c in cmd.split(";") if c.strip()]
+                            real_status_parts = []
+                            blocked = False
+                            for single_cmd in cmds:
+                                if not validate_cmd(single_cmd, is_config=False):
+                                    print(f"[X] CMD blocked: {single_cmd}")
+                                    blocked = True
+                                    break
+                                real_status_parts.append(netmiko_execute(single_cmd, is_config=False))
+ 
+                            if blocked:
                                 continue
  
-                    # --- AI INVESTIGATE ---
-                    investigate_prompt = f"NEW_LOG: {sanitize_log(raw_log)}. Request investigation command."
-                    ai_req = ask_ai(investigate_prompt)
+                            real_status = "\n".join(real_status_parts)
  
-                    if "INVESTIGATE" in ai_req:
-                        if "| CMD: " not in ai_req:
-                            print(f"[X] AI format error, skip: {ai_req}")
-                            continue
-                        save_security_dataset(investigate_prompt, ai_req)
+                            # --- COUNTER MEMORY + AI DECISION ---
+                            category = ""
+                            if "CATEGORY: " in ai_req:
+                                category = ai_req.split("CATEGORY: ")[1].split(" |")[0].strip()
  
-                        cmd = ai_req.split("| CMD: ")[1].split("|")[0].strip()
+                            port_from_log = ""
+                            port_m = re.search(r'(Gi|Fa|GigabitEthernet|FastEthernet)\d+/\d+(/\d+)?', raw_log, re.IGNORECASE)
+                            if port_m:
+                                port_from_log = port_m.group(0)
+ 
+                            prev = get_prev_counter(port_from_log, category)
+                            prev_str = f" | PREV_COUNTERS: {prev}" if prev else ""
+ 
+                            final_query = f"LOG: {raw_log} | REAL_STATUS: {real_status}{prev_str}. What is your final action?"
+                            decision = ask_ai(final_query)
 
-                        cmds = [c.strip() for c in cmd.split(";") if c.strip()]
-                        real_status_parts = []
-                        blocked = False
-                        for single_cmd in cmds:
-                            if not validate_cmd(single_cmd, is_config=False):
-                                print(f"[X] CMD blocked: {single_cmd}")
-                                blocked = True
-                                break
-                            real_status_parts.append(netmiko_execute(single_cmd, is_config=False))
+                            if "ACTION:" in decision:
+                                save_security_dataset(final_query, decision)
  
-                        if blocked:
-                            continue
+                            counter_match = re.search(r'(?:Dropped|Total dropped)\D*(\d+)', real_status)
+                            if counter_match and port_from_log and category:
+                                save_counter(port_from_log, category, counter_match.group(1))
  
-                        real_status = "\n".join(real_status_parts)
- 
-                        # --- COUNTER MEMORY + AI DECISION ---
-                        category = ""
-                        if "CATEGORY: " in ai_req:
-                            category = ai_req.split("CATEGORY: ")[1].split(" |")[0].strip()
- 
-                        port_from_log = ""
-                        port_m = re.search(r'(Gi|Fa|GigabitEthernet|FastEthernet)\d+/\d+(/\d+)?', raw_log, re.IGNORECASE)
-                        if port_m:
-                            port_from_log = port_m.group(0)
- 
-                        prev = get_prev_counter(port_from_log, category)
-                        prev_str = f" | PREV_COUNTERS: {prev}" if prev else ""
- 
-                        final_query = f"LOG: {raw_log} | REAL_STATUS: {real_status}{prev_str}. What is your final action?"
-                        decision = ask_ai(final_query)
+                            print(f"\n[AI DECISION]: {decision}")
 
-                        if "ACTION:" in decision:
-                            save_security_dataset(final_query, decision)
+                            # Caution: an LLM "ACTION: shutdown" becomes a real Netmiko config action here.
+                            # Keep this path enabled only when threat confirmation is strong enough to justify
+                            # the risk of a false-positive port shutdown.
+                            if "ACTION: shutdown" in decision:
+                                port_match = re.search(r'(Gi|Fa|GigabitEthernet|FastEthernet)\d+/\d+(/\d+)?', decision, re.IGNORECASE)
+                                if port_match:
+                                    port_name = port_match.group(0)
+                                    port_check = netmiko_execute(f"show interfaces {port_name} status", is_config=False)
+                                    check_lower = port_check.lower()
+                                    if any(x in check_lower for x in ["disabled", "err-disabled"]):
+                                        print(f"[V] Python Block: {port_name} already disabled. Skip.")
+                                        event_buffer.append(f"{time.strftime('%H:%M:%S')} | BLOCKED: {port_name} already disabled")
+                                    else:
+                                        if "| CMD: " not in decision:
+                                            print(f"[X] AI format error, skip: {decision}")
+                                            continue
+                                        config_cmd = decision.split("| CMD: ")[1].split("|")[0].strip()
+                                        if not validate_cmd(config_cmd, is_config=True):
+                                            print(f"[X] CONFIG blocked: {config_cmd}")
+                                            continue
+                                        result = netmiko_execute(config_cmd, is_config=True)
+                                        print(f"[V] RESULT: {result}")
+                                        record_shutdown(port_name, raw_log[:80])
+                                        event_buffer.append(f"{time.strftime('%H:%M:%S')} | AI SHUTDOWN {port_name} | {raw_log[:80]}")
  
-                        counter_match = re.search(r'(?:Dropped|Total dropped)\D*(\d+)', real_status)
-                        if counter_match and port_from_log and category:
-                            save_counter(port_from_log, category, counter_match.group(1))
- 
-                        print(f"\n[AI DECISION]: {decision}")
-
-                        # Caution: an LLM "ACTION: shutdown" becomes a real Netmiko config action here.
-                        # Keep this path enabled only when threat confirmation is strong enough to justify
-                        # the risk of a false-positive port shutdown.
-                        if "ACTION: shutdown" in decision:
-                            port_match = re.search(r'(Gi|Fa|GigabitEthernet|FastEthernet)\d+/\d+(/\d+)?', decision, re.IGNORECASE)
-                            if port_match:
-                                port_name = port_match.group(0)
-                                port_check = netmiko_execute(f"show interfaces {port_name} status", is_config=False)
-                                check_lower = port_check.lower()
-                                if any(x in check_lower for x in ["disabled", "err-disabled"]):
-                                    print(f"[V] Python Block: {port_name} already disabled. Skip.")
-                                    event_buffer.append(f"{time.strftime('%H:%M:%S')} | BLOCKED: {port_name} already disabled")
+                                        # POSTCMD (clear counters after RA Guard shutdown)
+                                        if "POSTCMD: " in decision:
+                                            post_cmd = decision.split("POSTCMD: ")[1].split("|")[0].strip()
+                                            if post_cmd.startswith("clear "):
+                                                netmiko_execute(post_cmd, is_config=False)
+                                                print(f"[V] POST: {post_cmd}")
                                 else:
-                                    if "| CMD: " not in decision:
-                                        print(f"[X] AI format error, skip: {decision}")
-                                        continue
-                                    config_cmd = decision.split("| CMD: ")[1].split("|")[0].strip()
-                                    if not validate_cmd(config_cmd, is_config=True):
-                                        print(f"[X] CONFIG blocked: {config_cmd}")
-                                        continue
-                                    result = netmiko_execute(config_cmd, is_config=True)
-                                    print(f"[V] RESULT: {result}")
-                                    record_shutdown(port_name, raw_log[:80])
-                                    event_buffer.append(f"{time.strftime('%H:%M:%S')} | AI SHUTDOWN {port_name} | {raw_log[:80]}")
- 
-                                    # POSTCMD (clear counters after RA Guard shutdown)
-                                    if "POSTCMD: " in decision:
-                                        post_cmd = decision.split("POSTCMD: ")[1].split("|")[0].strip()
-                                        if post_cmd.startswith("clear "):
-                                            netmiko_execute(post_cmd, is_config=False)
-                                            print(f"[V] POST: {post_cmd}")
+                                    print("[X] Cannot extract port. Skip.")
                             else:
-                                print("[X] Cannot extract port. Skip.")
+                                print("[V] NO ACTION REQUIRED: System is already secure.")
+                                event_buffer.append(f"{time.strftime('%H:%M:%S')} | {raw_log[:80]} | NO ACTION")
                         else:
-                            print("[V] NO ACTION REQUIRED: System is already secure.")
-                            event_buffer.append(f"{time.strftime('%H:%M:%S')} | {raw_log[:80]} | NO ACTION")
-                    else:
-                        print(f"[*] AI Info: {ai_req}")
+                            print(f"[*] AI Info: {ai_req}")
  
-        now = time.time()
-        if now - last_scan_time >= SCAN_INTERVAL:
-            last_scan_time = now
-            raw_status = scan_ports()
-            ports = parse_port_status(raw_status)
-
-            maintenance_entries, expired_ports = cleanup_expired_whitelist()
-            maintenance_ports = {e["port"]: e for e in maintenance_entries}
- 
-            if expired_ports:
-                ports_to_shut = []
-                for p in expired_ports:
-                    if p in ports and ports[p] in ["connected", "trunk"]:
-                        print(f"[MAINTENANCE] {p} timer expired but port is UP. Releasing to normal operation.")
-                    else:
-                        ports_to_shut.append(p)
-                
-                if ports_to_shut:
-                    range_cmd = build_range_cmd(ports_to_shut)
-                    shut_cmd = range_cmd + "\\n" + "shutdown"
-                    print(f"[MAINTENANCE EXPIRED] Shutting down unused: {ports_to_shut}")
-                    result = netmiko_execute(shut_cmd, is_config=True)
-                    print(f"[SCAN] EXPIRED SHUTDOWN: {result}")
-                    event_buffer.append(f"{time.strftime('%H:%M:%S')} | MAINTENANCE EXPIRED SHUTDOWN: {ports_to_shut}")
-                    for p in ports_to_shut:
-                        record_shutdown(p, "maintenance timer expired")
-                    
-            ready_to_shutdown = []
             now = time.time()
+            if now - last_scan_time >= SCAN_INTERVAL:
+                last_scan_time = now
+                raw_status = scan_ports()
+                ports = parse_port_status(raw_status)
+
+                maintenance_entries, expired_ports = cleanup_expired_whitelist()
+                maintenance_ports = {e["port"]: e for e in maintenance_entries}
  
-            for port, status in ports.items():
-                # --- [1] Processing Port in WHITELIST (MAINTENANCE) ---
-                if port in maintenance_ports:
-                    entry = maintenance_ports[port]
-                    mode = entry.get("mode", "unknown")
-                    verified = entry.get("verified", False)
-                    expire = entry.get("expire", 0)
-                    open_at = entry.get("open_at", now)
+                if expired_ports:
+                    ports_to_shut = []
+                    for p in expired_ports:
+                        if p in ports and ports[p] in ["connected", "trunk"]:
+                            print(f"[MAINTENANCE] {p} timer expired but port is UP. Releasing to normal operation.")
+                        else:
+                            ports_to_shut.append(p)
+                
+                    if ports_to_shut:
+                        range_cmd = build_range_cmd(ports_to_shut)
+                        shut_cmd = range_cmd + "\\n" + "shutdown"
+                        print(f"[MAINTENANCE EXPIRED] Shutting down unused: {ports_to_shut}")
+                        result = netmiko_execute(shut_cmd, is_config=True)
+                        print(f"[SCAN] EXPIRED SHUTDOWN: {result}")
+                        event_buffer.append(f"{time.strftime('%H:%M:%S')} | MAINTENANCE EXPIRED SHUTDOWN: {ports_to_shut}")
+                        for p in ports_to_shut:
+                            record_shutdown(p, "maintenance timer expired")
                     
-                    if status in ["connected", "trunk"]:
-                        if port in port_down_since: del port_down_since[port]
+                ready_to_shutdown = []
+                now = time.time()
+ 
+                for port, status in ports.items():
+                    # --- [1] Processing Port in WHITELIST (MAINTENANCE) ---
+                    if port in maintenance_ports:
+                        entry = maintenance_ports[port]
+                        mode = entry.get("mode", "unknown")
+                        verified = entry.get("verified", False)
+                        expire = entry.get("expire", 0)
+                        open_at = entry.get("open_at", now)
+                    
+                        if status in ["connected", "trunk"]:
+                            if port in port_down_since: del port_down_since[port]
 
-                        # A. TRUNK FLOW: Check CDP Identity (7s)
-                        if mode == "trunk" and not verified:
-                            print(f"[MAINTENANCE] {port} (trunk) UP — Waiting 7s for CDP verification...")
-                            time.sleep(7)
-                            expected = entry.get("expected_device", "")
-                            found, actual_name = verify_trunk_cdp_identity(port, expected)
-                            if found:
-                                print(f"[CDP] [SUCCESS] {port} Identity Verified: {actual_name}")
-                                entry["verified"] = True
-                                save_maintenance_whitelist(maintenance_entries)
-                            else:
-                                print(f"[CDP] [FAIL] {port} — No trusted identity found!")
-                                ready_to_shutdown.append(port)
-                    
-                        # B. FLOW ACCESS: Check 802.1X (RADIUS)
-                        elif mode == "access" and not verified:
-                            if check_dot1x_auth_in_logs(port): 
-                                print(f"[802.1X] [SUCCESS] {port} Authenticated via Radius.")
-                                entry["verified"] = True
-                                save_maintenance_whitelist(maintenance_entries)
-                            else:
-                                # If open after 5min but not Auth Success -> Shutdown
-                                if now - open_at > 300:
-                                    print(f"[802.1X] [FAIL] {port} Authentication Timeout (5 mins).")
-                                    ready_to_shutdown.append(port)
+                            # A. TRUNK FLOW: Check CDP Identity (7s)
+                            if mode == "trunk" and not verified:
+                                print(f"[MAINTENANCE] {port} (trunk) UP — Waiting 7s for CDP verification...")
+                                time.sleep(7)
+                                expected = entry.get("expected_device", "")
+                                found, actual_name = verify_trunk_cdp_identity(port, expected)
+                                if found:
+                                    print(f"[CDP] [SUCCESS] {port} Identity Verified: {actual_name}")
+                                    entry["verified"] = True
+                                    save_maintenance_whitelist(maintenance_entries)
                                 else:
-                                    print(f"[MAINTENANCE] {port} (access) UP — Waiting for 802.1X auth...")
+                                    print(f"[CDP] [FAIL] {port} — No trusted identity found!")
+                                    ready_to_shutdown.append(port)
+                    
+                            # B. FLOW ACCESS: Check 802.1X (RADIUS)
+                            elif mode == "access" and not verified:
+                                if check_dot1x_auth_in_logs(port): 
+                                    print(f"[802.1X] [SUCCESS] {port} Authenticated via Radius.")
+                                    entry["verified"] = True
+                                    save_maintenance_whitelist(maintenance_entries)
+                                else:
+                                    # If open after 5min but not Auth Success -> Shutdown
+                                    if now - open_at > 300:
+                                        print(f"[802.1X] [FAIL] {port} Authentication Timeout (5 mins).")
+                                        ready_to_shutdown.append(port)
+                                    else:
+                                        print(f"[MAINTENANCE] {port} (access) UP — Waiting for 802.1X auth...")
 
-                        # C. VERIFIED → maintenance complete, remove from whitelist
-                        elif verified:
+                            # C. VERIFIED → maintenance complete, remove from whitelist
+                            elif verified:
+                                if expire > 0 and now < expire:
+                                    remaining = int((expire - now) / 60)
+                                    if remaining > 0:
+                                        print(f"[MAINTENANCE] {port} ({mode}) VERIFIED + protected. {remaining}m remaining.")
+                                else:
+                                    print(f"[MAINTENANCE] {port} ({mode}) UP + VERIFIED. Maintenance complete.")
+                                    new_maint = [e for e in maintenance_entries if e["port"] != port]
+                                    save_maintenance_whitelist(new_maint)
+                                    print(f"[WHITELIST] {port} removed. Now a normal port.")
+
+                        elif status == "notconnect":
                             if expire > 0 and now < expire:
                                 remaining = int((expire - now) / 60)
-                                if remaining > 0:
-                                    print(f"[MAINTENANCE] {port} ({mode}) VERIFIED + protected. {remaining}m remaining.")
-                            else:
-                                print(f"[MAINTENANCE] {port} ({mode}) UP + VERIFIED. Maintenance complete.")
-                                new_maint = [e for e in maintenance_entries if e["port"] != port]
-                                save_maintenance_whitelist(new_maint)
-                                print(f"[WHITELIST] {port} removed. Now a normal port.")
-
-                    elif status == "notconnect":
-                        if expire > 0 and now < expire:
-                            remaining = int((expire - now) / 60)
-                            print(f"[MAINTENANCE] {port} is DOWN. Window: {remaining}m left.")
-                        elif expire > 0 and now >= expire:
-                            print(f"[MAINTENANCE] {port} window CLOSED (Expired).")
-                            ready_to_shutdown.append(port)
-                        elif expire == 0:
-                            if port not in port_down_since:
-                                port_down_since[port] = now
-                                print(f"[SCAN] {port} notconnect (no timer) - starting 60s countdown")
-                            elif now - port_down_since[port] >= 60:
+                                print(f"[MAINTENANCE] {port} is DOWN. Window: {remaining}m left.")
+                            elif expire > 0 and now >= expire:
+                                print(f"[MAINTENANCE] {port} window CLOSED (Expired).")
                                 ready_to_shutdown.append(port)
+                            elif expire == 0:
+                                if port not in port_down_since:
+                                    port_down_since[port] = now
+                                    print(f"[SCAN] {port} notconnect (no timer) - starting {NOTCONNECT_COUNTDOWN_S}s countdown")
+                                elif now - port_down_since[port] >= NOTCONNECT_COUNTDOWN_S:
+                                    ready_to_shutdown.append(port)
                     
+                        elif status == "disabled":
+                            if port in port_down_since:
+                                del port_down_since[port]
+                            new_maint = [e for e in maintenance_entries if e["port"] != port]
+                            save_maintenance_whitelist(new_maint)
+                            print(f"\033[1;33m[MAINTENANCE]\033[0m \033[1m{port}\033[0m err-disabled by switch. Removed from whitelist.")
+                        continue
+
+                    # --- [2] Processing ports outside WHITELIST ---
+                    if port in rollback_whitelist: continue
+
+                    if status == "notconnect":
+                        if port not in port_down_since:
+                            port_down_since[port] = now
+                        elif now - port_down_since[port] >= NOTCONNECT_COUNTDOWN_S:
+                            ready_to_shutdown.append(port)
+                
+                    elif status == "connected" or status == "trunk":
+                        if port in port_down_since:
+                            del port_down_since[port]
+                
                     elif status == "disabled":
                         if port in port_down_since:
                             del port_down_since[port]
-                        new_maint = [e for e in maintenance_entries if e["port"] != port]
-                        save_maintenance_whitelist(new_maint)
-                        print(f"\033[1;33m[MAINTENANCE]\033[0m \033[1m{port}\033[0m err-disabled by switch. Removed from whitelist.")
-                    continue
+                        if port in maintenance_ports:
+                            new_maint = [e for e in maintenance_entries if e["port"] != port]
+                            save_maintenance_whitelist(new_maint)
+                            print(f"[MAINTENANCE] {port} err-disabled by switch. Removed from whitelist.")
 
-                # --- [2] Processing ports outside WHITELIST ---
-                if port in rollback_whitelist: continue
+                # --- [3] BREAKDOWN: BATCH SHUTDOWN & CLEANUP JSON---
+                if ready_to_shutdown:
+                    range_cmd = build_range_cmd(ready_to_shutdown)
+                    result = netmiko_execute(range_cmd + "\\nshutdown", is_config=True)
+                    print(f"\033[1;31m[SCAN] BATCH SHUTDOWN:\033[0m \033[1m {result}\033[0m")
 
-                if status == "notconnect":
-                    if port not in port_down_since:
-                        port_down_since[port] = now
-                    elif now - port_down_since[port] >= 60:
-                        ready_to_shutdown.append(port)
-                
-                elif status == "connected" or status == "trunk":
-                    if port in port_down_since:
-                        del port_down_since[port]
-                
-                elif status == "disabled":
-                    if port in port_down_since:
-                        del port_down_since[port]
-                    if port in maintenance_ports:
-                        new_maint = [e for e in maintenance_entries if e["port"] != port]
-                        save_maintenance_whitelist(new_maint)
-                        print(f"[MAINTENANCE] {port} err-disabled by switch. Removed from whitelist.")
-
-            # --- [3] BREAKDOWN: BATCH SHUTDOWN & CLEANUP JSON---
-            if ready_to_shutdown:
-                range_cmd = build_range_cmd(ready_to_shutdown)
-                result = netmiko_execute(range_cmd + "\\nshutdown", is_config=True)
-                print(f"\033[1;31m[SCAN] BATCH SHUTDOWN:\033[0m \033[1m {result}\033[0m")
-
-                event_buffer.append(f"{time.strftime('%H:%M:%S')} | SCAN BATCH SHUTDOWN: {ready_to_shutdown}")
+                    event_buffer.append(f"{time.strftime('%H:%M:%S')} | SCAN BATCH SHUTDOWN: {ready_to_shutdown}")
             
-                new_maintenance = [e for e in maintenance_entries if e["port"] not in ready_to_shutdown]
-                save_maintenance_whitelist(new_maintenance)
+                    new_maintenance = [e for e in maintenance_entries if e["port"] not in ready_to_shutdown]
+                    save_maintenance_whitelist(new_maintenance)
             
-                for p in ready_to_shutdown:
-                    record_shutdown(p, "security audit / maintenance expired")
-                    if p in port_down_since: del port_down_since[p]
+                    for p in ready_to_shutdown:
+                        record_shutdown(p, "security audit / maintenance expired")
+                        if p in port_down_since: del port_down_since[p]
  
-        if time.time() - last_policy_check > POLICY_RESCAN_INTERVAL:
-            print(f"\n\033[1;36m[RESCAN]\033[0m Running periodic RA Guard policy check...")
-            rescan_ra_policies()
-            last_policy_check = time.time()
+            if time.time() - last_policy_check > POLICY_RESCAN_INTERVAL:
+                print(f"\n\033[1;36m[RESCAN]\033[0m Running periodic RA Guard policy check...")
+                rescan_ra_policies()
+                last_policy_check = time.time()
  
-        if time.time() - last_report_time >= REPORT_INTERVAL:
-            print("\033[1;35m[REPORT]\033[0m Generating...")
-            report = ai_full_report()
-            print(f"\033[1;35m[REPORT]\033[0m \033[3m {report[:200]}\033[0m")
-            send_report(report)
-            event_buffer.clear()
-            last_report_time = time.time()
-            pass
+            if time.time() - last_report_time >= REPORT_INTERVAL:
+                print("\033[1;35m[REPORT]\033[0m Generating...")
+                report = ai_full_report()
+                print(f"\033[1;35m[REPORT]\033[0m \033[3m {report[:200]}\033[0m")
+                send_report(report)
+                event_buffer.clear()
+                last_report_time = time.time()
+                pass
  
-    except Exception as e:
-        print(f"\n[X] Loop error: {e}")
+        except Exception as e:
+            print(f"\n[X] Loop error: {e}")
  
-    time.sleep(10)
+        time.sleep(10)
+
+
+if __name__ == "__main__":
+    main()
