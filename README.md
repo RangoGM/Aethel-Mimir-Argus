@@ -115,6 +115,9 @@ ARGUS was evaluated on physical hardware across 24 attack windows over approxima
 ├── pipeline/
 │   ├── grafana-setup.sh
 │   └── grafana-uninstall.sh
+├── grafana-dashboard-configs/
+│   ├── Catalyst_2960_dashboard_author_dattrangia.json
+│   └── Router_2811_dashboard_author_dattrangia.json
 ├── result/
 │   ├── enhanced_results_extended.json
 │   ├── mimir_150_cumulative.png
@@ -144,6 +147,16 @@ ARGUS requires additional local settings for:
 - Ubuntu report host and report-log path
 
 Older Cisco devices may require legacy SSH compatibility options. Leave `SSH_LEGACY = None` for modern devices and set it only when older equipment requires it.
+
+## Grafana Dashboards
+
+Importable dashboard JSON files are stored in `grafana-dashboard-configs/`. They use public-safe placeholders instead of lab addresses:
+
+- `<SWITCH_IP>` for Catalyst 2960 Loki `device_source` labels and Prometheus `instance` labels
+- `<ROUTER_IP>` for Cisco 2811 Loki `device_source` labels and Prometheus `instance` labels
+- `<YOUR_LATITUDE>` and `<YOUR_LONGITUDE>` for optional Geomap panels
+
+After running `pipeline/grafana-setup.sh`, edit `/etc/loki/promtail-config.yaml` only on the monitoring host if you want map panels. Uncomment the optional `location`, `latitude`, and `longitude` labels, replace the placeholders with local coordinates, then restart Promtail. Keep real coordinates and private IP addresses out of public commits.
 
 ## Models
 

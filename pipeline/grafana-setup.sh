@@ -121,6 +121,15 @@ scrape_configs:
           - localhost
         labels:
           job: cisco
+          # Optional Grafana Geomap labels. Uncomment and set string values
+          # if you want this log stream to appear on a map panel.
+          # location: "Lab Edge"
+          # latitude: "<YOUR_LATITUDE>"
+          # longitude: "<YOUR_LONGITUDE>"
+          # src_lat: "<YOUR_SOURCE_LATITUDE>"
+          # src_lon: "<YOUR_SOURCE_LONGITUDE>"
+          # dst_lat: "<YOUR_DESTINATION_LATITUDE>"
+          # dst_lon: "<YOUR_DESTINATION_LONGITUDE>"
           __path__: /var/log/network.log
     pipeline_stages:
       - regex:
@@ -166,6 +175,10 @@ scrape_configs:
           - localhost
         labels:
           job: varlogs
+          # Optional Grafana Geomap labels.
+          # location: "Ubuntu Server"
+          # latitude: "<YOUR_LATITUDE>"
+          # longitude: "<YOUR_LONGITUDE>"
           __path__: /var/log/*.log
 
   - job_name: syslog
@@ -174,6 +187,10 @@ scrape_configs:
           - localhost
         labels:
           job: syslog
+          # Optional Grafana Geomap labels.
+          # location: "Ubuntu Syslog"
+          # latitude: "<YOUR_LATITUDE>"
+          # longitude: "<YOUR_LONGITUDE>"
           __path__: /var/log/syslog
 
   - job_name: auth
@@ -182,6 +199,10 @@ scrape_configs:
           - localhost
         labels:
           job: auth
+          # Optional Grafana Geomap labels.
+          # location: "Ubuntu Auth"
+          # latitude: "<YOUR_LATITUDE>"
+          # longitude: "<YOUR_LONGITUDE>"
           __path__: /var/log/auth.log
 
   - job_name: nginx
@@ -190,6 +211,10 @@ scrape_configs:
           - localhost
         labels:
           job: nginx
+          # Optional Grafana Geomap labels.
+          # location: "Nginx"
+          # latitude: "<YOUR_LATITUDE>"
+          # longitude: "<YOUR_LONGITUDE>"
           __path__: /var/log/nginx/*.log
     pipeline_stages:
       - regex:
@@ -204,6 +229,10 @@ scrape_configs:
           - localhost
         labels:
           job: ai-report
+          # Optional Grafana Geomap labels.
+          # location: "AI Report Host"
+          # latitude: "<YOUR_LATITUDE>"
+          # longitude: "<YOUR_LONGITUDE>"
           __path__: /var/log/ai-report/ai_summary.log
     pipeline_stages:
       - regex:
